@@ -2,7 +2,10 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timedelta
 import json
-from .utils import Embed, Permissions, event_dispatcher, db
+import asyncio
+from .utils import Embed, Permissions, event_dispatcher
+from database import get_connection
+import sqlite3
 
 class AutoMod(commands.Cog):
     """🛡️ Sistem Moderasi Otomatis"""
@@ -12,22 +15,6 @@ class AutoMod(commands.Cog):
         self.spam_check = {}
         self.config = self.load_config()
         self.register_handlers()
-
-    async def setup_tables(self):
-        """Setup necessary database tables"""
-        async with db.pool.cursor() as cursor:
-            # Warnings table
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS warnings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL,
-                    guild_id TEXT NOT NULL,
-                    warning_type TEXT NOT NULL,
-                    reason TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await db.pool.commit()
 
     def register_handlers(self):
         """Register event handlers with dispatcher"""
@@ -168,24 +155,30 @@ class AutoMod(commands.Cog):
             await warning_msg.delete(delay=5)
 
             # Log warning to database
-            async with db.pool.cursor() as cursor:
-                await cursor.execute("""
+            conn = None
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                
+                cursor.execute("""
                     INSERT INTO warnings (user_id, guild_id, warning_type, reason)
                     VALUES (?, ?, ?, ?)
                 """, (str(message.author.id), str(message.guild.id), violation_type, reason))
-                await db.pool.commit()
+                conn.commit()
 
-            # Check warning threshold
-            async with db.pool.cursor() as cursor:
-                await cursor.execute("""
+                # Check warning threshold
+                cursor.execute("""
                     SELECT COUNT(*) FROM warnings
                     WHERE user_id = ? AND guild_id = ?
                     AND timestamp > datetime('now', '-1 day')
                 """, (str(message.author.id), str(message.guild.id)))
-                warning_count = (await cursor.fetchone())[0]
+                warning_count = cursor.fetchone()[0]
 
                 if warning_count >= self.config["punishments"]["warn_threshold"]:
                     await self.mute_user(message.author)
+            finally:
+                if conn:
+                    conn.close()
 
         except discord.Forbidden:
             pass  # Bot lacks permissions
@@ -264,6 +257,4 @@ class AutoMod(commands.Cog):
 
 async def setup(bot):
     """Setup the AutoMod cog"""
-    cog = AutoMod(bot)
-    await cog.setup_tables()
-    await bot.add_cog(cog)
+    await bot.add_cog(AutoMod(bot))
