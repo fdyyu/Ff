@@ -4,6 +4,8 @@ from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import asyncio
 from .utils import Embed, db, event_dispatcher
+import aiosqlite
+from pathlib import Path
 
 class Polls(commands.Cog):
     """📊 Sistem Polling Advanced"""
@@ -17,6 +19,11 @@ class Polls(commands.Cog):
     async def setup_tables(self):
         """Setup necessary database tables"""
         try:
+            if not hasattr(db, 'pool') or db.pool is None:
+                # Connect to database in same directory as main.py
+                db.pool = await aiosqlite.connect('shop.db')
+                db.pool.row_factory = aiosqlite.Row
+            
             async with db.pool.cursor() as cursor:
                 # Polls table
                 await cursor.execute("""
