@@ -272,6 +272,30 @@ def setup_database():
             )
         """)
 
+            
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS welcome_settings (
+                guild_id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                message TEXT,
+                embed_color INTEGER DEFAULT 3447003,
+                auto_role_id TEXT,
+                verification_required BOOLEAN DEFAULT FALSE,
+                custom_background TEXT,
+                custom_font TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS welcome_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                action_type TEXT NOT NULL
+            )
+        """)
+
         # AutoMod System Tables
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS automod_settings (
@@ -387,6 +411,9 @@ def setup_database():
             ("idx_rep_logs_guild", "rep_logs(guild_id)"),
             ("idx_audit_logs_guild", "audit_logs(guild_id)"),
             ("idx_audit_logs_user", "audit_logs(user_id)"),
+            ("idx_welcome_settings_guild", "welcome_settings(guild_id)"),
+            ("idx_welcome_logs_guild", "welcome_logs(guild_id)"),
+            ("idx_welcome_logs_user", "welcome_logs(user_id)"),
             # Music system indexes
             ("idx_music_settings_guild", "music_settings(guild_id)"),
             ("idx_playlists_guild", "playlists(guild_id)"),
