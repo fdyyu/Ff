@@ -7,7 +7,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 def get_connection(max_retries: int = 3, timeout: int = 5) -> sqlite3.Connection:
-    """Get SQLite database connection with retry mechanism"""
+    """Get SQLite daatabase connection with retry mechanism"""
     for attempt in range(max_retries):
         try:
             conn = sqlite3.connect('shop.db', timeout=timeout)
@@ -34,7 +34,7 @@ def setup_database():
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Create users table first (parent table)
+        # Admin System Tables (Keep Existing)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 growid TEXT PRIMARY KEY,
@@ -46,7 +46,6 @@ def setup_database():
             )
         """)
 
-        # Create user_discord mapping table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_growid (
                 discord_id TEXT PRIMARY KEY,
@@ -56,7 +55,6 @@ def setup_database():
             )
         """)
 
-        # Create products table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 code TEXT PRIMARY KEY,
@@ -68,7 +66,6 @@ def setup_database():
             )
         """)
 
-        # Create stock table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS stock (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +81,6 @@ def setup_database():
             )
         """)
 
-        # Create transactions table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +96,6 @@ def setup_database():
             )
         """)
 
-        # Create world_info table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS world_info (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -111,7 +106,6 @@ def setup_database():
             )
         """)
 
-        # Create bot_settings table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
@@ -120,7 +114,6 @@ def setup_database():
             )
         """)
 
-        # Create blacklist table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS blacklist (
                 growid TEXT PRIMARY KEY,
@@ -131,7 +124,6 @@ def setup_database():
             )
         """)
 
-        # Create admin_logs table (NEW)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS admin_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,7 +135,6 @@ def setup_database():
             )
         """)
 
-        # Create role_permissions table (NEW)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS role_permissions (
                 role_id TEXT PRIMARY KEY,
@@ -153,7 +144,6 @@ def setup_database():
             )
         """)
 
-        # Create user_activity table (NEW)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,12 +155,82 @@ def setup_database():
             )
         """)
 
-        # Create cache_table (NEW)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS cache_table (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Leveling System Tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS levels (
+                user_id TEXT NOT NULL,
+                guild_id TEXT NOT NULL,
+                xp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 0,
+                messages INTEGER DEFAULT 0,
+                last_message_time TIMESTAMP,
+                PRIMARY KEY (user_id, guild_id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS level_rewards (
+                guild_id TEXT NOT NULL,
+                level INTEGER NOT NULL,
+                role_id TEXT NOT NULL,
+                PRIMARY KEY (guild_id, level)
+            )
+        """)
+
+        # Reputation System Tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reputation (
+                user_id TEXT NOT NULL,
+                guild_id TEXT NOT NULL,
+                points INTEGER DEFAULT 0,
+                received_count INTEGER DEFAULT 0,
+                given_count INTEGER DEFAULT 0,
+                last_given TIMESTAMP,
+                PRIMARY KEY (user_id, guild_id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rep_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                giver_id TEXT NOT NULL,
+                receiver_id TEXT NOT NULL,
+                reason TEXT,
+                points INTEGER NOT NULL,
+                given_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Logging System Tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS logging_settings (
+                guild_id TEXT PRIMARY KEY,
+                log_channel TEXT,
+                enabled_events TEXT,
+                webhook_url TEXT,
+                ignored_channels TEXT,
+                ignored_users TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                target_id TEXT,
+                details TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -209,7 +269,6 @@ def setup_database():
                 WHERE key = NEW.key;
             END;
             """),
-            # New trigger for role_permissions
             ("""
             CREATE TRIGGER IF NOT EXISTS update_role_permissions_timestamp 
             AFTER UPDATE ON role_permissions
@@ -233,13 +292,19 @@ def setup_database():
             ("idx_transactions_growid", "transactions(growid)"),
             ("idx_transactions_created", "transactions(created_at)"),
             ("idx_blacklist_growid", "blacklist(growid)"),
-            # New indexes
             ("idx_admin_logs_admin", "admin_logs(admin_id)"),
             ("idx_admin_logs_created", "admin_logs(created_at)"),
             ("idx_user_activity_discord", "user_activity(discord_id)"),
             ("idx_user_activity_type", "user_activity(activity_type)"),
             ("idx_role_permissions_role", "role_permissions(role_id)"),
-            ("idx_cache_expires", "cache_table(expires_at)")
+            ("idx_cache_expires", "cache_table(expires_at)"),
+            ("idx_levels_user", "levels(user_id)"),
+            ("idx_levels_guild", "levels(guild_id)"),
+            ("idx_reputation_user", "reputation(user_id)"),
+            ("idx_reputation_guild", "reputation(guild_id)"),
+            ("idx_rep_logs_guild", "rep_logs(guild_id)"),
+            ("idx_audit_logs_guild", "audit_logs(guild_id)"),
+            ("idx_audit_logs_user", "audit_logs(user_id)")
         ]
 
         for idx_name, idx_cols in indexes:
@@ -278,9 +343,16 @@ def verify_database():
 
         # Check all tables exist
         tables = [
+            # Admin tables
             'users', 'user_growid', 'products', 'stock', 
             'transactions', 'world_info', 'bot_settings', 'blacklist',
-            'admin_logs', 'role_permissions', 'user_activity', 'cache_table'
+            'admin_logs', 'role_permissions', 'user_activity', 'cache_table',
+            # Leveling tables
+            'levels', 'level_rewards',
+            # Reputation tables
+            'reputation', 'rep_logs',
+            # Logging tables
+            'logging_settings', 'audit_logs'
         ]
 
         missing_tables = []
