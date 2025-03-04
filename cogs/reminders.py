@@ -1,13 +1,13 @@
 import discord
-from discord.ext import commands, tasks
-import asyncio
+from discord.ext import commands
 import sqlite3
-import pytz
 from datetime import datetime, timedelta
+import asyncio
 from typing import Optional, Dict, List
 from .utils import Embed, event_dispatcher
 from database import get_connection
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -27,20 +27,7 @@ class Reminders(commands.Cog):
             conn = get_connection()
             cursor = conn.cursor()
             
-            # Reminder settings
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS reminder_settings (
-                    guild_id TEXT PRIMARY KEY,
-                    max_reminders INTEGER DEFAULT 25,
-                    max_duration INTEGER DEFAULT 31536000,
-                    reminder_channel TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    mention_roles BOOLEAN DEFAULT FALSE,
-                    allow_everyone BOOLEAN DEFAULT FALSE
-                )
-            """)
-            
-            # Active reminders
+            # Reminders table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,26 +35,21 @@ class Reminders(commands.Cog):
                     channel_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     message TEXT NOT NULL,
-                    end_time DATETIME NOT NULL,
-                    repeat_interval TEXT,
-                    last_triggered DATETIME,
-                    mentions TEXT,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    trigger_time DATETIME NOT NULL,
+                    repeat_interval INTEGER,
+                    repeat_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
-            # Reminder templates
+            # Reminder settings table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS reminder_templates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    duration TEXT NOT NULL,
-                    created_by TEXT NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(guild_id, name)
+                CREATE TABLE IF NOT EXISTS reminder_settings (
+                    guild_id TEXT PRIMARY KEY,
+                    max_reminders INTEGER DEFAULT 10,
+                    max_duration INTEGER DEFAULT 2592000,
+                    default_channel TEXT,
+                    manager_role TEXT
                 )
             """)
             
@@ -86,11 +68,81 @@ class Reminders(commands.Cog):
     def register_handlers(self):
         """Register event handlers"""
         event_dispatcher.register('reminder_trigger', self.handle_reminder_trigger)
-        event_dispatcher.register('reminder_create', self.handle_reminder_create)
 
-    def cog_unload(self):
-        """Clean up when cog is unloaded"""
-        self.check_reminders.cancel()
+    async def handle_reminder_trigger(self, reminder_data):
+        """Handle reminder triggering"""
+        try:
+            guild = self.bot.get_guild(int(reminder_data["guild_id"]))
+            if not guild:
+                return
+
+            channel = guild.get_channel(int(reminder_data["channel_id"]))
+            if not channel:
+                return
+
+            user = guild.get_member(int(reminder_data["user_id"]))
+            if not user:
+                return
+
+            # Create embed for reminder
+            embed = Embed.create(
+                title="⏰ Reminder!",
+                description=reminder_data["message"],
+                color=discord.Color.blue(),
+                field_Created_by=user.mention,
+                field_Created_at=f"<t:{int(datetime.strptime(reminder_data['created_at'], '%Y-%m-%d %H:%M:%S').timestamp())}:R>"
+            )
+
+            # Send reminder
+            try:
+                await channel.send(
+                    content=f"{user.mention}, here's your reminder!",
+                    embed=embed
+                )
+            except discord.Forbidden:
+                try:
+                    await user.send(
+                        content="I couldn't send your reminder in the original channel!",
+                        embed=embed
+                    )
+                except discord.Forbidden:
+                    logger.error(f"Could not send reminder to user {user.id}")
+                    return
+
+            conn = None
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+
+                # Handle repeating reminders
+                if reminder_data.get("repeat_interval"):
+                    next_trigger = datetime.strptime(reminder_data["trigger_time"], '%Y-%m-%d %H:%M:%S') + \
+                                 timedelta(seconds=reminder_data["repeat_interval"])
+                    
+                    cursor.execute("""
+                        UPDATE reminders
+                        SET trigger_time = ?, repeat_count = repeat_count + 1
+                        WHERE id = ?
+                    """, (next_trigger.strftime('%Y-%m-%d %H:%M:%S'), reminder_data["id"]))
+                else:
+                    # Delete one-time reminder
+                    cursor.execute("""
+                        DELETE FROM reminders
+                        WHERE id = ?
+                    """, (reminder_data["id"],))
+
+                conn.commit()
+
+            except sqlite3.Error as e:
+                logger.error(f"Database error in handle_reminder_trigger: {e}")
+                if conn:
+                    conn.rollback()
+            finally:
+                if conn:
+                    conn.close()
+
+        except Exception as e:
+            logger.error(f"Error handling reminder trigger: {e}")
 
     def get_settings(self, guild_id: int) -> Dict:
         """Get reminder settings for a guild"""
@@ -106,23 +158,21 @@ class Reminders(commands.Cog):
             
             if not data:
                 default_settings = {
-                    'max_reminders': 25,
-                    'max_duration': 31536000,  # 1 year in seconds
-                    'reminder_channel': None,
-                    'timezone': 'UTC',
-                    'mention_roles': False,
-                    'allow_everyone': False
+                    'max_reminders': 10,
+                    'max_duration': 2592000,  # 30 days
+                    'default_channel': None,
+                    'manager_role': None
                 }
                 
                 cursor.execute("""
-                    INSERT INTO reminder_settings
-                    (guild_id, max_reminders, max_duration)
-                    VALUES (?, ?, ?)
-                """, (str(guild_id), 25, 31536000))
+                    INSERT INTO reminder_settings (guild_id)
+                    VALUES (?)
+                """, (str(guild_id),))
                 conn.commit()
                 return default_settings
                 
             return dict(data)
+            
         except sqlite3.Error as e:
             logger.error(f"Failed to get reminder settings: {e}")
             raise
@@ -130,52 +180,24 @@ class Reminders(commands.Cog):
             if conn:
                 conn.close()
 
-    async def parse_time(self, time_str: str, guild_timezone: str) -> datetime:
-        """Parse time string into datetime object"""
-        now = datetime.now(pytz.timezone(guild_timezone))
-        duration = 0
-        
-        # Parse duration format (e.g., 1h30m, 2d, 1w)
-        time_units = {
-            's': 1,
-            'm': 60,
-            'h': 3600,
-            'd': 86400,
-            'w': 604800
-        }
-        
-        current = ''
-        for char in time_str:
-            if char.isdigit():
-                current += char
-            elif char.lower() in time_units:
-                if current:
-                    duration += int(current) * time_units[char.lower()]
-                    current = ''
-                    
-        if duration == 0:
-            raise ValueError("Invalid time format")
-            
-        return now + timedelta(seconds=duration)
-
     @tasks.loop(seconds=30)
     async def check_reminders(self):
         """Check for due reminders"""
         current_time = datetime.utcnow()
-        conn = None
         
+        conn = None
         try:
             conn = get_connection()
             cursor = conn.cursor()
             
             cursor.execute("""
                 SELECT * FROM reminders
-                WHERE is_active = TRUE AND end_time <= ?
+                WHERE trigger_time <= ?
             """, (current_time.strftime('%Y-%m-%d %H:%M:%S'),))
             due_reminders = cursor.fetchall()
             
             for reminder in due_reminders:
-                await self.trigger_reminder(reminder)
+                await self.handle_reminder_trigger(dict(reminder))
                 
         except sqlite3.Error as e:
             logger.error(f"Failed to check reminders: {e}")
@@ -188,186 +210,120 @@ class Reminders(commands.Cog):
         """Wait until bot is ready"""
         await self.bot.wait_until_ready()
 
-    async def trigger_reminder(self, reminder: Dict):
-        """Trigger a reminder"""
-        channel = self.bot.get_channel(int(reminder['channel_id']))
-        if not channel:
-            return
+    def parse_time(self, time_str: str) -> int:
+        """Parse time string into seconds"""
+        total_seconds = 0
+        time_units = {
+            's': 1,
+            'm': 60,
+            'h': 3600,
+            'd': 86400,
+            'w': 604800
+        }
+        
+        pattern = r'(\d+)([smhdw])'
+        matches = re.findall(pattern, time_str.lower())
+        
+        for value, unit in matches:
+            total_seconds += int(value) * time_units[unit]
             
-        guild = channel.guild
-        settings = self.get_settings(guild.id)
-        
-        # Format mentions
-        mentions = []
-        if reminder['mentions']:
-            for mention in reminder['mentions'].split(','):
-                if mention.startswith('u:'):
-                    user = guild.get_member(int(mention[2:]))
-                    if user:
-                        mentions.append(user.mention)
-                elif mention.startswith('r:') and settings['mention_roles']:
-                    role = guild.get_role(int(mention[2:]))
-                    if role:
-                        mentions.append(role.mention)
-                        
-        mention_str = ' '.join(mentions) if mentions else ''
-        
-        embed = Embed.create(
-            title="⏰ Reminder",
-            description=reminder['message'],
-            field_Set_by=f"<@{reminder['user_id']}>",
-            field_Created=f"<t:{int(datetime.strptime(reminder['created_at'], '%Y-%m-%d %H:%M:%S').timestamp())}:R>",
-            color=discord.Color.blue()
-        )
-        
-        await channel.send(content=mention_str, embed=embed)
-        
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
+        if not total_seconds:
+            raise ValueError("Invalid time format")
             
-            # Handle repeating reminders
-            if reminder['repeat_interval']:
-                next_time = datetime.strptime(reminder['end_time'], '%Y-%m-%d %H:%M:%S')
-                interval = reminder['repeat_interval']
-                
-                if interval.endswith('h'):
-                    next_time += timedelta(hours=int(interval[:-1]))
-                elif interval.endswith('d'):
-                    next_time += timedelta(days=int(interval[:-1]))
-                elif interval.endswith('w'):
-                    next_time += timedelta(weeks=int(interval[:-1]))
-                
-                cursor.execute("""
-                    UPDATE reminders
-                    SET end_time = ?, last_triggered = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                """, (next_time.strftime('%Y-%m-%d %H:%M:%S'), reminder['id']))
-            else:
-                cursor.execute("""
-                    UPDATE reminders
-                    SET is_active = FALSE, last_triggered = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                """, (reminder['id'],))
-                
-            conn.commit()
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to update reminder: {e}")
-        finally:
-            if conn:
-                conn.close()
+        return total_seconds
 
-    @commands.group(name="reminder", aliases=["remind"])
+    @commands.group(name="reminder", aliases=["rm"])
     async def reminder(self, ctx):
         """⏰ Reminder commands"""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 
-    @reminder.command(name="set", usage="<time> <message>")
-    async def set_reminder(self, ctx, time: str, *, message: str):
-        """Set a new reminder
-        Time format: 30s, 5m, 2h, 1d, 1w"""
+    @reminder.command(name="add", aliases=["create", "set"])
+    async def add_reminder(self, ctx, time: str, *, message: str):
+        """Add a reminder"""
         settings = self.get_settings(ctx.guild.id)
+        
+        try:
+            duration = self.parse_time(time)
+            if duration > settings['max_duration']:
+                return await ctx.send(f"❌ Duration cannot exceed {settings['max_duration']} seconds!")
+        except ValueError:
+            return await ctx.send("❌ Invalid time format! Use: 1d, 12h, 30m, etc.")
+            
+        trigger_time = datetime.utcnow() + timedelta(seconds=duration)
         
         conn = None
         try:
             conn = get_connection()
             cursor = conn.cursor()
             
-            # Check reminder limits
+            # Check reminder limit
             cursor.execute("""
                 SELECT COUNT(*) as count FROM reminders
-                WHERE guild_id = ? AND user_id = ? AND is_active = TRUE
+                WHERE guild_id = ? AND user_id = ?
             """, (str(ctx.guild.id), str(ctx.author.id)))
-            data = cursor.fetchone()
+            count = cursor.fetchone()['count']
             
-            if data['count'] >= settings['max_reminders']:
-                return await ctx.send("❌ You've reached the maximum number of active reminders!")
+            if count >= settings['max_reminders']:
+                return await ctx.send(f"❌ You can only have {settings['max_reminders']} active reminders!")
             
-            end_time = await self.parse_time(time, settings['timezone'])
-            
-            # Check duration limit
-            duration = (end_time - datetime.now(pytz.timezone(settings['timezone']))).total_seconds()
-            if duration > settings['max_duration']:
-                return await ctx.send("❌ Reminder duration exceeds the maximum allowed!")
-                
+            # Add reminder
             cursor.execute("""
                 INSERT INTO reminders
-                (guild_id, channel_id, user_id, message, end_time)
+                (guild_id, channel_id, user_id, message, trigger_time)
                 VALUES (?, ?, ?, ?, ?)
             """, (
                 str(ctx.guild.id),
                 str(ctx.channel.id),
                 str(ctx.author.id),
                 message,
-                end_time.strftime('%Y-%m-%d %H:%M:%S')
+                trigger_time.strftime('%Y-%m-%d %H:%M:%S')
             ))
+            reminder_id = cursor.lastrowid
             conn.commit()
             
-            await ctx.send(f"✅ Reminder set for <t:{int(end_time.timestamp())}:R>")
+            await ctx.send(
+                f"✅ I'll remind you about: **{message}**\n"
+                f"⏰ When: <t:{int(trigger_time.timestamp())}:R>\n"
+                f"🔔 ID: `{reminder_id}`"
+            )
             
-        except ValueError:
-            await ctx.send("❌ Invalid time format! Use: 30s, 5m, 2h, 1d, 1w")
         except sqlite3.Error as e:
-            logger.error(f"Failed to set reminder: {e}")
-            await ctx.send("❌ An error occurred while setting the reminder")
+            logger.error(f"Failed to add reminder: {e}")
+            await ctx.send("❌ An error occurred while creating the reminder")
+            if conn:
+                conn.rollback()
         finally:
             if conn:
                 conn.close()
 
-    @reminder.command(name="repeat")
-    async def set_repeat_reminder(self, ctx, interval: str, time: str, *, message: str):
-        """Set a repeating reminder
-        Interval format: 12h, 1d, 1w
-        Time format: 30s, 5m, 2h, 1d, 1w"""
-        if not interval[-1] in ['h', 'd', 'w']:
-            return await ctx.send("❌ Invalid interval format! Use: 12h, 1d, 1w")
-            
-        try:
-            int(interval[:-1])
-        except ValueError:
-            return await ctx.send("❌ Invalid interval format! Use: 12h, 1d, 1w")
-            
-        settings = self.get_settings(ctx.guild.id)
-        
+    @reminder.command(name="remove", aliases=["delete", "del"])
+    async def remove_reminder(self, ctx, reminder_id: int):
+        """Remove a reminder"""
         conn = None
         try:
             conn = get_connection()
             cursor = conn.cursor()
             
-            end_time = await self.parse_time(time, settings['timezone'])
-            
             cursor.execute("""
-                INSERT INTO reminders
-                (guild_id, channel_id, user_id, message, end_time, repeat_interval)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                str(ctx.guild.id),
-                str(ctx.channel.id),
-                str(ctx.author.id),
-                message,
-                end_time.strftime('%Y-%m-%d %H:%M:%S'),
-                interval
-            ))
+                DELETE FROM reminders
+                WHERE id = ? AND guild_id = ? AND user_id = ?
+            """, (reminder_id, str(ctx.guild.id), str(ctx.author.id)))
             conn.commit()
             
-            await ctx.send(
-                f"✅ Repeating reminder set for <t:{int(end_time.timestamp())}:R>\n"
-                f"Repeats every {interval}"
-            )
+            if cursor.rowcount > 0:
+                await ctx.send("✅ Reminder removed!")
+            else:
+                await ctx.send("❌ Reminder not found or not yours!")
             
-        except ValueError:
-            await ctx.send("❌ Invalid time format! Use: 30s, 5m, 2h, 1d, 1w")
         except sqlite3.Error as e:
-            logger.error(f"Failed to set repeating reminder: {e}")
-            await ctx.send("❌ An error occurred while setting the reminder")
+            logger.error(f"Failed to remove reminder: {e}")
+            await ctx.send("❌ An error occurred while removing the reminder")
         finally:
             if conn:
                 conn.close()
 
-    @reminder.command(name="list")
+    @reminder.command(name="list", aliases=["show"])
     async def list_reminders(self, ctx):
         """List your active reminders"""
         conn = None
@@ -377,234 +333,65 @@ class Reminders(commands.Cog):
             
             cursor.execute("""
                 SELECT * FROM reminders
-                WHERE guild_id = ? AND user_id = ? AND is_active = TRUE
-                ORDER BY end_time ASC
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY trigger_time ASC
             """, (str(ctx.guild.id), str(ctx.author.id)))
             reminders = cursor.fetchall()
             
             if not reminders:
                 return await ctx.send("❌ You have no active reminders!")
-                
+            
             embed = Embed.create(
-                title="📋 Your Active Reminders",
+                title="📝 Your Reminders",
                 color=discord.Color.blue()
             )
             
-            for i, reminder in enumerate(reminders[:10], 1):
-                end_time = datetime.strptime(reminder['end_time'], '%Y-%m-%d %H:%M:%S')
-                repeat_str = f"\nRepeats: {reminder['repeat_interval']}" if reminder['repeat_interval'] else ""
-                
+            for reminder in reminders:
+                trigger_time = datetime.strptime(reminder['trigger_time'], '%Y-%m-%d %H:%M:%S')
                 embed.add_field(
-                    name=f"{i}. Due {discord.utils.format_dt(end_time)}",
-                    value=f"Message: {reminder['message']}{repeat_str}",
+                    name=f"ID: {reminder['id']}",
+                    value=f"⏰ When: <t:{int(trigger_time.timestamp())}:R>\n"
+                          f"📝 Message: {reminder['message']}",
                     inline=False
                 )
-                
-            if len(reminders) > 10:
-                embed.set_footer(text=f"And {len(reminders) - 10} more reminders...")
                 
             await ctx.send(embed=embed)
             
         except sqlite3.Error as e:
             logger.error(f"Failed to list reminders: {e}")
-            await ctx.send("❌ An error occurred while getting your reminders")
-        finally:
-            if conn:
-                conn.close()
-
-    @reminder.command(name="cancel", aliases=["delete"])
-    async def cancel_reminder(self, ctx, reminder_id: int):
-        """Cancel a reminder by its ID"""
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT * FROM reminders
-                WHERE id = ? AND guild_id = ? AND user_id = ?
-            """, (reminder_id, str(ctx.guild.id), str(ctx.author.id)))
-            reminder = cursor.fetchone()
-            
-            if not reminder:
-                return await ctx.send("❌ Reminder not found!")
-                
-            cursor.execute("""
-                UPDATE reminders
-                SET is_active = FALSE
-                WHERE id = ?
-            """, (reminder_id,))
-            conn.commit()
-            
-            await ctx.send("✅ Reminder cancelled!")
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to cancel reminder: {e}")
-            await ctx.send("❌ An error occurred while cancelling the reminder")
+            await ctx.send("❌ An error occurred while getting reminders")
         finally:
             if conn:
                 conn.close()
 
     @reminder.command(name="clear")
     async def clear_reminders(self, ctx):
-        """Clear all your active reminders"""
+        """Clear all your reminders"""
         conn = None
         try:
             conn = get_connection()
             cursor = conn.cursor()
             
             cursor.execute("""
-                UPDATE reminders
-                SET is_active = FALSE
-                WHERE guild_id = ? AND user_id = ? AND is_active = TRUE
+                DELETE FROM reminders
+                WHERE guild_id = ? AND user_id = ?
             """, (str(ctx.guild.id), str(ctx.author.id)))
             conn.commit()
             
-            await ctx.send("✅ All your reminders have been cleared!")
+            if cursor.rowcount > 0:
+                await ctx.send(f"✅ Cleared {cursor.rowcount} reminders!")
+            else:
+                await ctx.send("❌ You had no active reminders!")
             
         except sqlite3.Error as e:
             logger.error(f"Failed to clear reminders: {e}")
-            await ctx.send("❌ An error occurred while clearing your reminders")
+            await ctx.send("❌ An error occurred while clearing reminders")
         finally:
             if conn:
                 conn.close()
 
-    @commands.group(name="remindertemplate", aliases=["rtemplate"])
-    @commands.has_permissions(manage_guild=True)
-    async def reminder_template(self, ctx):
-        """📋 Reminder template management"""
-        if ctx.invoked_subcommand is None:
-            await ctx.send_help(ctx.command)
-
-    @reminder_template.command(name="add")
-    async def add_template(self, ctx, name: str, duration: str, *, message: str):
-        """Add a reminder template"""
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO reminder_templates
-                (guild_id, name, message, duration, created_by)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                str(ctx.guild.id),
-                name,
-                message,
-                duration,
-                str(ctx.author.id)
-            ))
-            conn.commit()
-            
-            await ctx.send(f"✅ Template `{name}` added successfully!")
-            
-        except sqlite3.IntegrityError:
-            await ctx.send("❌ A template with that name already exists!")
-        except sqlite3.Error as e:
-            logger.error(f"Failed to add template: {e}")
-            await ctx.send("❌ An error occurred while adding the template")
-        finally:
-            if conn:
-                conn.close()
-
-    @reminder_template.command(name="list")
-    async def list_templates(self, ctx):
-        """List all reminder templates"""
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT * FROM reminder_templates
-                WHERE guild_id = ?
-                ORDER BY name ASC
-            """, (str(ctx.guild.id),))
-            templates = cursor.fetchall()
-            
-            if not templates:
-                return await ctx.send("❌ No templates found!")
-                
-            embed = Embed.create(
-                title="📋 Reminder Templates",
-                color=discord.Color.blue()
-            )
-            
-            for template in templates:
-                creator = ctx.guild.get_member(int(template['created_by']))
-                embed.add_field(
-                    name=template['name'],
-                    value=f"Duration: {template['duration']}\n"
-                          f"Message: {template['message']}\n"
-                          f"Created by: {creator.mention if creator else 'Unknown'}",
-                    inline=False
-                )
-                
-            await ctx.send(embed=embed)
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to list templates: {e}")
-            await ctx.send("❌ An error occurred while getting the templates")
-        finally:
-            if conn:
-                conn.close()
-
-    @reminder_template.command(name="use")
-    async def use_template(self, ctx, name: str, *, additional_message: str = ""):
-        """Create a reminder using a template"""
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT * FROM reminder_templates
-                WHERE guild_id = ? AND name = ?
-            """, (str(ctx.guild.id), name))
-            template = cursor.fetchone()
-            
-            if not template:
-                return await ctx.send("❌ Template not found!")
-                
-            message = template['message']
-            if additional_message:
-                message += f"\n{additional_message}"
-                
-            await self.set_reminder(ctx, template['duration'], message=message)
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to use template: {e}")
-            await ctx.send("❌ An error occurred while using the template")
-        finally:
-            if conn:
-                conn.close()
-
-    @reminder_template.command(name="delete")
-    async def delete_template(self, ctx, name: str):
-        """Delete a reminder template"""
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                DELETE FROM reminder_templates
-                WHERE guild_id = ? AND name = ?
-            """, (str(ctx.guild.id), name))
-            conn.commit()
-            
-            await ctx.send(f"✅ Template `{name}` deleted!")
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to delete template: {e}")
-            await ctx.send("❌ An error occurred while deleting the template")
-        finally:
-            if conn:
-                conn.close()
-
-    @commands.group(name="reminderset")
-    @commands.has_permissions(manage_guild=True)
+    @commands.group(name="reminderset", aliases=["rmset"])
+    @commands.has_permissions(administrator=True)
     async def reminderset(self, ctx):
         """⚙️ Reminder system settings"""
         if ctx.invoked_subcommand is None:
@@ -614,20 +401,26 @@ class Reminders(commands.Cog):
                 title="⚙️ Reminder Settings",
                 color=discord.Color.blue(),
                 field_Max_Reminders=str(settings['max_reminders']),
-                field_Max_Duration=f"{settings['max_duration'] // 86400} days",
-                field_Timezone=settings['timezone'],
-                field_Reminder_Channel=f"<#{settings['reminder_channel']}>" if settings['reminder_channel'] else "Default",
-                field_Allow_Role_Mentions=str(settings['mention_roles']),
-                field_Allow_Everyone=str(settings['allow_everyone'])
+                field_Max_Duration=f"{settings['max_duration']} seconds"
             )
             
+            if settings['default_channel']:
+                channel = ctx.guild.get_channel(int(settings['default_channel']))
+                if channel:
+                    embed.add_field(name="Default Channel", value=channel.mention)
+                    
+            if settings['manager_role']:
+                role = ctx.guild.get_role(int(settings['manager_role']))
+                if role:
+                    embed.add_field(name="Manager Role", value=role.mention)
+                    
             await ctx.send(embed=embed)
 
     @reminderset.command(name="maxreminders")
     async def set_max_reminders(self, ctx, limit: int):
         """Set maximum reminders per user"""
         if limit < 1:
-            return await ctx.send("❌ Limit must be positive!")
+            return await ctx.send("❌ Limit must be at least 1!")
             
         conn = None
         try:
@@ -645,16 +438,18 @@ class Reminders(commands.Cog):
             
         except sqlite3.Error as e:
             logger.error(f"Failed to set max reminders: {e}")
-            await ctx.send("❌ An error occurred while updating the settings")
+            await ctx.send("❌ An error occurred while updating settings")
         finally:
             if conn:
                 conn.close()
 
     @reminderset.command(name="maxduration")
-    async def set_max_duration(self, ctx, days: int):
-        """Set maximum reminder duration in days"""
-        if days < 1:
-            return await ctx.send("❌ Duration must be positive!")
+    async def set_max_duration(self, ctx, *, duration: str):
+        """Set maximum reminder duration"""
+        try:
+            max_seconds = self.parse_time(duration)
+        except ValueError:
+            return await ctx.send("❌ Invalid duration format!")
             
         conn = None
         try:
@@ -665,49 +460,20 @@ class Reminders(commands.Cog):
                 UPDATE reminder_settings
                 SET max_duration = ?
                 WHERE guild_id = ?
-            """, (days * 86400, str(ctx.guild.id)))
+            """, (max_seconds, str(ctx.guild.id)))
             conn.commit()
             
-            await ctx.send(f"✅ Maximum reminder duration set to {days} days")
+            await ctx.send(f"✅ Maximum reminder duration set to {duration}")
             
         except sqlite3.Error as e:
             logger.error(f"Failed to set max duration: {e}")
-            await ctx.send("❌ An error occurred while updating the settings")
+            await ctx.send("❌ An error occurred while updating settings")
         finally:
             if conn:
                 conn.close()
 
-    @reminderset.command(name="timezone")
-    async def set_timezone(self, ctx, timezone: str):
-        """Set server timezone"""
-        try:
-            pytz.timezone(timezone)
-        except pytz.exceptions.UnknownTimeZoneError:
-            return await ctx.send("❌ Invalid timezone! Use a valid timezone name (e.g., UTC, America/New_York)")
-            
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                UPDATE reminder_settings
-                SET timezone = ?
-                WHERE guild_id = ?
-            """, (timezone, str(ctx.guild.id)))
-            conn.commit()
-            
-            await ctx.send(f"✅ Server timezone set to {timezone}")
-            
-        except sqlite3.Error as e:
-            logger.error(f"Failed to set timezone: {e}")
-            await ctx.send("❌ An error occurred while updating the settings")
-        finally:
-            if conn:
-                conn.close()
-
-    @reminderset.command(name="channel")
-    async def set_reminder_channel(self, ctx, channel: discord.TextChannel = None):
+    @reminderset.command(name="defaultchannel")
+    async def set_default_channel(self, ctx, channel: discord.TextChannel = None):
         """Set default reminder channel"""
         channel_id = str(channel.id) if channel else None
         
@@ -718,7 +484,7 @@ class Reminders(commands.Cog):
             
             cursor.execute("""
                 UPDATE reminder_settings
-                SET reminder_channel = ?
+                SET default_channel = ?
                 WHERE guild_id = ?
             """, (channel_id, str(ctx.guild.id)))
             conn.commit()
@@ -726,18 +492,20 @@ class Reminders(commands.Cog):
             if channel:
                 await ctx.send(f"✅ Default reminder channel set to {channel.mention}")
             else:
-                await ctx.send("✅ Default reminder channel removed")
-                
+                await ctx.send("✅ Default reminder channel cleared")
+            
         except sqlite3.Error as e:
-            logger.error(f"Failed to set reminder channel: {e}")
-            await ctx.send("❌ An error occurred while updating the settings")
+            logger.error(f"Failed to set default channel: {e}")
+            await ctx.send("❌ An error occurred while updating settings")
         finally:
             if conn:
                 conn.close()
 
-    @reminderset.command(name="mentionroles")
-    async def toggle_role_mentions(self, ctx):
-        """Toggle role mentions in reminders"""
+    @reminderset.command(name="managerrole")
+    async def set_manager_role(self, ctx, role: discord.Role = None):
+        """Set reminder manager role"""
+        role_id = str(role.id) if role else None
+        
         conn = None
         try:
             conn = get_connection()
@@ -745,29 +513,33 @@ class Reminders(commands.Cog):
             
             cursor.execute("""
                 UPDATE reminder_settings
-                SET mention_roles = NOT mention_roles
+                SET manager_role = ?
                 WHERE guild_id = ?
-            """, (str(ctx.guild.id),))
+            """, (role_id, str(ctx.guild.id)))
             conn.commit()
             
-            cursor.execute("""
-                SELECT mention_roles FROM reminder_settings
-                WHERE guild_id = ?
-            """, (str(ctx.guild.id),))
-            data = cursor.fetchone()
-            
-            enabled = data['mention_roles']
-            await ctx.send(f"✅ Role mentions {'enabled' if enabled else 'disabled'}")
+            if role:
+                await ctx.send(f"✅ Reminder manager role set to {role.mention}")
+            else:
+                await ctx.send("✅ Reminder manager role cleared")
             
         except sqlite3.Error as e:
-            logger.error(f"Failed to toggle role mentions: {e}")
-            await ctx.send("❌ An error occurred while updating the settings")
+            logger.error(f"Failed to set manager role: {e}")
+            await ctx.send("❌ An error occurred while updating settings")
         finally:
             if conn:
                 conn.close()
 
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild):
+        """Initialize settings when bot joins a guild"""
+        try:
+            self.get_settings(guild.id)  # This will create default settings
+        except Exception as e:
+            logger.error(f"Failed to initialize reminder settings for guild {guild.id}: {e}")
+
 async def setup(bot):
     """Setup the Reminders cog"""
     cog = Reminders(bot)
-    cog.setup_tables()  # Not async anymore since using sqlite3
+    cog.setup_tables()
     await bot.add_cog(cog)
