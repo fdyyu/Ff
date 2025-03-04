@@ -2,11 +2,11 @@ import discord
 from discord.ext import commands
 import asyncio
 import wavelink
-import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from .utils import Embed, event_dispatcher
-from database import get_connection  # Import fungsi database yang sudah ada
+from database import get_connection
+import sqlite3
 
 class Music(commands.Cog):
     """🎵 Advanced Music System"""
@@ -18,7 +18,7 @@ class Music(commands.Cog):
         self.now_playing = {}
         self.text_channels = {}
         self.register_handlers()
-
+        
     async def connect_nodes(self):
         """Connect to Lavalink nodes"""
         await self.bot.wait_until_ready()
@@ -72,42 +72,6 @@ class Music(commands.Cog):
         finally:
             if conn:
                 conn.close()
-                
-    def register_handlers(self):
-        """Register event handlers"""
-        event_dispatcher.register('track_start', self.handle_track_start)
-        event_dispatcher.register('track_end', self.handle_track_end)
-        event_dispatcher.register('track_error', self.handle_track_error)
-
-    async def get_settings(self, guild_id: int) -> Dict:
-        """Get music settings for a guild"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
-                SELECT * FROM music_settings WHERE guild_id = ?
-            """, (str(guild_id),))
-            data = await cursor.fetchone()
-            
-            if not data:
-                default_settings = {
-                    'default_volume': 100,
-                    'vote_skip_ratio': 0.5,
-                    'max_queue_size': 500,
-                    'max_song_duration': 7200,
-                    'dj_role': None,
-                    'music_channel': None,
-                    'announce_songs': True,
-                    'auto_play': False
-                }
-                
-                await cursor.execute("""
-                    INSERT INTO music_settings
-                    (guild_id, default_volume, vote_skip_ratio)
-                    VALUES (?, ?, ?)
-                """, (str(guild_id), 100, 0.5))
-                await db.pool.commit()
-                return default_settings
-                
-            return dict(data)
 
     async def ensure_voice(self, ctx):
         """Ensure the bot and user are in a voice channel"""
@@ -115,17 +79,12 @@ class Music(commands.Cog):
             raise commands.CommandError("❌ You need to be in a voice channel!")
             
         if not ctx.voice_client:
-            try:
-                player = await ctx.author.voice.channel.connect(cls=wavelink.Player)
-                self.music_queues[ctx.guild.id] = []
-                self.text_channels[ctx.guild.id] = ctx.channel
-                return player
-            except Exception as e:
-                raise commands.CommandError(f"❌ Failed to join voice channel: {str(e)}")
+            await ctx.author.voice.channel.connect(cls=wavelink.Player)
+            self.music_queues[ctx.guild.id] = []
+            self.text_channels[ctx.guild.id] = ctx.channel
         else:
             if ctx.author.voice.channel != ctx.voice_client.channel:
                 raise commands.CommandError("❌ You need to be in my voice channel!")
-            return ctx.voice_client
 
     async def handle_track_start(self, player, track):
         """Handle track start event"""
@@ -183,41 +142,32 @@ class Music(commands.Cog):
     @commands.command(name="play", aliases=["p"])
     async def play(self, ctx, *, query: str):
         """🎵 Play a song"""
-        player = await self.ensure_voice(ctx)
+        await self.ensure_voice(ctx)
         
-        try:
-            # Search for tracks using wavelink v3
-            if not query.startswith('http'):
-                search_query = f'ytsearch:{query}'
-                tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.YouTubeTrack, search_query)
-            else:
-                tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.Track, query)
-
-            if not tracks:
-                return await ctx.send("❌ No songs found!")
-                
-            track = tracks[0]
-            track.requester = ctx.author
+        # Search for track
+        tracks = await wavelink.YouTubeTrack.search(query)
+        if not tracks:
+            return await ctx.send("❌ No songs found!")
             
-            settings = await self.get_settings(ctx.guild.id)
+        track = tracks[0]
+        track.requester = ctx.author
+        
+        settings = await self.get_settings(ctx.guild.id)
+        
+        # Check duration
+        if track.duration > settings['max_song_duration'] * 1000:
+            return await ctx.send("❌ Song is too long!")
             
-            # Check duration
-            if track.duration > settings['max_song_duration'] * 1000:
-                return await ctx.send("❌ Song is too long!")
+        # Add to queue or play
+        if ctx.voice_client.is_playing():
+            if len(self.music_queues[ctx.guild.id]) >= settings['max_queue_size']:
+                return await ctx.send("❌ Queue is full!")
                 
-            # Add to queue or play
-            if player.is_playing():
-                if len(self.music_queues[ctx.guild.id]) >= settings['max_queue_size']:
-                    return await ctx.send("❌ Queue is full!")
-                    
-                self.music_queues[ctx.guild.id].append(track)
-                await ctx.send(f"✅ Added to queue: **{track.title}**")
-            else:
-                await player.play(track)
-                await ctx.send(f"🎵 Now playing: **{track.title}**")
-
-        except Exception as e:
-            await ctx.send(f"❌ An error occurred: {str(e)}")
+            self.music_queues[ctx.guild.id].append(track)
+            await ctx.send(f"✅ Added to queue: **{track.title}**")
+        else:
+            await ctx.voice_client.play(track)
+            await ctx.send(f"🎵 Now playing: **{track.title}**")
 
     @commands.command(name="stop")
     async def stop(self, ctx):
@@ -242,8 +192,7 @@ class Music(commands.Cog):
         if settings['dj_role']:
             dj_role = ctx.guild.get_role(int(settings['dj_role']))
             if dj_role and dj_role not in ctx.author.roles:
-                # Implement vote skip
-                # TODO: Add vote skip system
+                # TODO: Implement vote skip system
                 return await ctx.send("❌ You need the DJ role to skip!")
         
         ctx.voice_client.stop()
@@ -351,204 +300,236 @@ class Music(commands.Cog):
     @playlist.command(name="create")
     async def playlist_create(self, ctx, *, name: str):
         """Create a new playlist"""
-        async with db.pool.cursor() as cursor:
-            try:
-                await cursor.execute("""
-                    INSERT INTO playlists (guild_id, name, owner_id)
-                    VALUES (?, ?, ?)
-                """, (str(ctx.guild.id), name, str(ctx.author.id)))
-                await db.pool.commit()
-                await ctx.send(f"✅ Created playlist: **{name}**")
-            except:
-                await ctx.send("❌ A playlist with that name already exists!")
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO playlists (guild_id, name, owner_id)
+                VALUES (?, ?, ?)
+            """, (str(ctx.guild.id), name, str(ctx.author.id)))
+            conn.commit()
+            await ctx.send(f"✅ Created playlist: **{name}**")
+        except sqlite3.IntegrityError:
+            await ctx.send("❌ A playlist with that name already exists!")
+        finally:
+            if conn:
+                conn.close()
 
     @playlist.command(name="add")
     async def playlist_add(self, ctx, playlist_name: str, *, query: str):
         """Add a song to a playlist"""
-        # Use new wavelink search
-        if not query.startswith('http'):
-            search_query = f'ytsearch:{query}'
-            tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.YouTubeTrack, search_query)
-        else:
-            tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.Track, query)
-
+        tracks = await wavelink.YouTubeTrack.search(query)
         if not tracks:
             return await ctx.send("❌ No songs found!")
             
         track = tracks[0]
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT id FROM playlists
                 WHERE guild_id = ? AND name = ?
             """, (str(ctx.guild.id), playlist_name))
-            playlist = await cursor.fetchone()
+            playlist = cursor.fetchone()
+            
             if not playlist:
                 return await ctx.send("❌ Playlist not found!")
                 
-            await cursor.execute("""
+            cursor.execute("""
                 INSERT INTO playlist_songs
                 (playlist_id, track_url, track_title, added_by)
                 VALUES (?, ?, ?, ?)
             """, (playlist['id'], track.uri, track.title, str(ctx.author.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Added **{track.title}** to playlist: **{playlist_name}**")
+            await ctx.send(f"✅ Added **{track.title}** to playlist: **{playlist_name}**")
+        finally:
+            if conn:
+                conn.close()
 
     @playlist.command(name="play")
     async def playlist_play(self, ctx, *, name: str):
         """Play a playlist"""
-        player = await self.ensure_voice(ctx)
+        await self.ensure_voice(ctx)
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT ps.track_url, ps.track_title
                 FROM playlists p
                 JOIN playlist_songs ps ON p.id = ps.playlist_id
                 WHERE p.guild_id = ? AND p.name = ?
             """, (str(ctx.guild.id), name))
-            songs = await cursor.fetchall()
+            songs = cursor.fetchall()
             
-        if not songs:
-            return await ctx.send("❌ Playlist is empty!")
-            
-        for song in songs:
-            try:
-                # Use new wavelink search
-                if not song['track_url'].startswith('http'):
-                    search_query = f'ytsearch:{song["track_url"]}'
-                    tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.YouTubeTrack, search_query)
-                else:
-                    tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.Track, song['track_url'])
-
+            if not songs:
+                return await ctx.send("❌ Playlist is empty!")
+                
+            for song in songs:
+                tracks = await wavelink.YouTubeTrack.search(song['track_url'])
                 if tracks:
                     track = tracks[0]
                     track.requester = ctx.author
                     
-                    if player.is_playing():
+                    if ctx.voice_client.is_playing():
                         self.music_queues[ctx.guild.id].append(track)
                     else:
-                        await player.play(track)
-            except Exception as e:
-                await ctx.send(f"❌ Error loading track {song['track_title']}: {str(e)}")
+                        await ctx.voice_client.play(track)
                     
-        await ctx.send(f"✅ Added {len(songs)} songs from playlist **{name}** to queue")
+            await ctx.send(f"✅ Added {len(songs)} songs from playlist **{name}** to queue")
+        finally:
+            if conn:
+                conn.close()
 
     @playlist.command(name="list")
     async def playlist_list(self, ctx):
         """List all playlists"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT name, owner_id, 
                     (SELECT COUNT(*) FROM playlist_songs ps WHERE ps.playlist_id = p.id) as song_count
                 FROM playlists p
                 WHERE guild_id = ?
             """, (str(ctx.guild.id),))
-            playlists = await cursor.fetchall()
+            playlists = cursor.fetchall()
             
-        if not playlists:
-            return await ctx.send("❌ No playlists found!")
-            
-        embed = Embed.create(
-            title="📋 Server Playlists",
-            color=discord.Color.blue()
-        )
-        
-        for playlist in playlists:
-            owner = ctx.guild.get_member(int(playlist['owner_id']))
-            embed.add_field(
-                name=playlist['name'],
-                value=f"Owner: {owner.mention if owner else 'Unknown'}\n"
-                      f"Songs: {playlist['song_count']}",
-                inline=False
+            if not playlists:
+                return await ctx.send("❌ No playlists found!")
+                
+            embed = Embed.create(
+                title="📋 Server Playlists",
+                color=discord.Color.blue()
             )
             
-        await ctx.send(embed=embed)
+            for playlist in playlists:
+                owner = ctx.guild.get_member(int(playlist['owner_id']))
+                embed.add_field(
+                    name=playlist['name'],
+                    value=f"Owner: {owner.mention if owner else 'Unknown'}\n"
+                          f"Songs: {playlist['song_count']}",
+                    inline=False
+                )
+                
+            await ctx.send(embed=embed)
+        finally:
+            if conn:
+                conn.close()
 
     @playlist.command(name="view")
     async def playlist_view(self, ctx, *, name: str):
         """View songs in a playlist"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT ps.track_title, ps.added_by, ps.added_at
                 FROM playlists p
                 JOIN playlist_songs ps ON p.id = ps.playlist_id
                 WHERE p.guild_id = ? AND p.name = ?
                 ORDER BY ps.added_at ASC
             """, (str(ctx.guild.id), name))
-            songs = await cursor.fetchall()
+            songs = cursor.fetchall()
             
-        if not songs:
-            return await ctx.send("❌ Playlist is empty!")
-            
-        embed = Embed.create(
-            title=f"📋 Playlist: {name}",
-            color=discord.Color.blue()
-        )
-        
-        for i, song in enumerate(songs[:15], 1):
-            added_by = ctx.guild.get_member(int(song['added_by']))
-            embed.add_field(
-                name=f"{i}. {song['track_title']}",
-                value=f"Added by: {added_by.mention if added_by else 'Unknown'}\n"
-                      f"Added: <t:{int(datetime.strptime(song['added_at'], '%Y-%m-%d %H:%M:%S').timestamp())}:R>",
-                inline=False
+            if not songs:
+                return await ctx.send("❌ Playlist is empty!")
+                
+            embed = Embed.create(
+                title=f"📋 Playlist: {name}",
+                color=discord.Color.blue()
             )
             
-        if len(songs) > 15:
-            embed.set_footer(text=f"And {len(songs) - 15} more songs...")
-            
-        await ctx.send(embed=embed)
+            for i, song in enumerate(songs[:15], 1):
+                added_by = ctx.guild.get_member(int(song['added_by']))
+                embed.add_field(
+                    name=f"{i}. {song['track_title']}",
+                    value=f"Added by: {added_by.mention if added_by else 'Unknown'}\n"
+                          f"Added: <t:{int(datetime.strptime(song['added_at'], '%Y-%m-%d %H:%M:%S').timestamp())}:R>",
+                    inline=False
+                )
+                
+            if len(songs) > 15:
+                embed.set_footer(text=f"And {len(songs) - 15} more songs...")
+                
+            await ctx.send(embed=embed)
+        finally:
+            if conn:
+                conn.close()
 
     @playlist.command(name="remove")
     async def playlist_remove(self, ctx, playlist_name: str, *, song_name: str):
         """Remove a song from a playlist"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT p.id, p.owner_id FROM playlists p
                 WHERE p.guild_id = ? AND p.name = ?
             """, (str(ctx.guild.id), playlist_name))
-            playlist = await cursor.fetchone()
+            playlist = cursor.fetchone()
             
-        if not playlist:
-            return await ctx.send("❌ Playlist not found!")
-            
-        if str(ctx.author.id) != playlist['owner_id']:
-            return await ctx.send("❌ You don't own this playlist!")
-            
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+            if not playlist:
+                return await ctx.send("❌ Playlist not found!")
+                
+            if str(ctx.author.id) != playlist['owner_id']:
+                return await ctx.send("❌ You don't own this playlist!")
+                
+            cursor.execute("""
                 DELETE FROM playlist_songs
                 WHERE playlist_id = ? AND track_title LIKE ?
             """, (playlist['id'], f"%{song_name}%"))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Removed matching songs from playlist: **{playlist_name}**")
+            await ctx.send(f"✅ Removed matching songs from playlist: **{playlist_name}**")
+        finally:
+            if conn:
+                conn.close()
 
     @playlist.command(name="delete")
     async def playlist_delete(self, ctx, *, name: str):
         """Delete a playlist"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT owner_id FROM playlists
                 WHERE guild_id = ? AND name = ?
             """, (str(ctx.guild.id), name))
-            playlist = await cursor.fetchone()
+            playlist = cursor.fetchone()
             
-        if not playlist:
-            return await ctx.send("❌ Playlist not found!")
-            
-        if str(ctx.author.id) != playlist['owner_id']:
-            return await ctx.send("❌ You don't own this playlist!")
-            
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+            if not playlist:
+                return await ctx.send("❌ Playlist not found!")
+                
+            if str(ctx.author.id) != playlist['owner_id']:
+                return await ctx.send("❌ You don't own this playlist!")
+                
+            cursor.execute("""
                 DELETE FROM playlists
                 WHERE guild_id = ? AND name = ?
             """, (str(ctx.guild.id), name))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Deleted playlist: **{name}**")
+            await ctx.send(f"✅ Deleted playlist: **{name}**")
+        finally:
+            if conn:
+                conn.close()
 
     @commands.group(name="musicset")
     @commands.has_permissions(manage_guild=True)
@@ -578,15 +559,22 @@ class Music(commands.Cog):
         if not 0 <= volume <= 200:
             return await ctx.send("❌ Volume must be between 0 and 200!")
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE music_settings
                 SET default_volume = ?
                 WHERE guild_id = ?
             """, (volume, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Default volume set to {volume}%")
+            await ctx.send(f"✅ Default volume set to {volume}%")
+        finally:
+            if conn:
+                conn.close()
 
     @musicset.command(name="maxduration")
     async def set_max_duration(self, ctx, minutes: int):
@@ -594,15 +582,22 @@ class Music(commands.Cog):
         if minutes < 1:
             return await ctx.send("❌ Duration must be positive!")
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE music_settings
                 SET max_song_duration = ?
                 WHERE guild_id = ?
             """, (minutes * 60, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Maximum song duration set to {minutes} minutes")
+            await ctx.send(f"✅ Maximum song duration set to {minutes} minutes")
+        finally:
+            if conn:
+                conn.close()
 
     @musicset.command(name="maxqueue")
     async def set_max_queue(self, ctx, size: int):
@@ -610,94 +605,123 @@ class Music(commands.Cog):
         if size < 1:
             return await ctx.send("❌ Queue size must be positive!")
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE music_settings
                 SET max_queue_size = ?
                 WHERE guild_id = ?
             """, (size, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Maximum queue size set to {size}")
+            await ctx.send(f"✅ Maximum queue size set to {size}")
+        finally:
+            if conn:
+                conn.close()
 
     @musicset.command(name="djrole")
     async def set_dj_role(self, ctx, role: discord.Role = None):
         """Set DJ role"""
-        role_id = str(role.id) if role else None
-        
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE music_settings
                 SET dj_role = ?
                 WHERE guild_id = ?
-            """, (role_id, str(ctx.guild.id)))
-            await db.pool.commit()
+            """, (str(role.id) if role else None, str(ctx.guild.id)))
+            conn.commit()
             
-        if role:
-            await ctx.send(f"✅ DJ role set to {role.mention}")
-        else:
-            await ctx.send("✅ DJ role removed")
+            if role:
+                await ctx.send(f"✅ DJ role set to {role.mention}")
+            else:
+                await ctx.send("✅ DJ role removed")
+        finally:
+            if conn:
+                conn.close()
 
     @musicset.command(name="channel")
     async def set_music_channel(self, ctx, channel: discord.TextChannel = None):
         """Set music commands channel"""
-        channel_id = str(channel.id) if channel else None
-        
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE music_settings
                 SET music_channel = ?
                 WHERE guild_id = ?
-            """, (channel_id, str(ctx.guild.id)))
-            await db.pool.commit()
+            """, (str(channel.id) if channel else None, str(ctx.guild.id)))
+            conn.commit()
             
-        if channel:
-            await ctx.send(f"✅ Music commands restricted to {channel.mention}")
-        else:
-            await ctx.send("✅ Music commands allowed in all channels")
+            if channel:
+                await ctx.send(f"✅ Music commands restricted to {channel.mention}")
+            else:
+                await ctx.send("✅ Music commands allowed in all channels")
+        finally:
+            if conn:
+                conn.close()
 
     @musicset.command(name="announce")
     async def toggle_announcements(self, ctx):
         """Toggle song announcements"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE music_settings
                 SET announce_songs = NOT announce_songs
                 WHERE guild_id = ?
             """, (str(ctx.guild.id),))
-            await db.pool.commit()
+            conn.commit()
             
-            await cursor.execute("""
+            cursor.execute("""
                 SELECT announce_songs FROM music_settings
                 WHERE guild_id = ?
             """, (str(ctx.guild.id),))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             
-        enabled = data['announce_songs']
-        await ctx.send(f"✅ Song announcements {'enabled' if enabled else 'disabled'}")
+            enabled = data['announce_songs']
+            await ctx.send(f"✅ Song announcements {'enabled' if enabled else 'disabled'}")
+        finally:
+            if conn:
+                conn.close()
 
     @musicset.command(name="autoplay")
     async def toggle_autoplay(self, ctx):
         """Toggle auto-play feature"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE music_settings
                 SET auto_play = NOT auto_play
                 WHERE guild_id = ?
             """, (str(ctx.guild.id),))
-            await db.pool.commit()
+            conn.commit()
             
-            await cursor.execute("""
+            cursor.execute("""
                 SELECT auto_play FROM music_settings
                 WHERE guild_id = ?
             """, (str(ctx.guild.id),))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             
-        enabled = data['auto_play']
-        await ctx.send(f"✅ Auto-play {'enabled' if enabled else 'disabled'}")
+            enabled = data['auto_play']
+            await ctx.send(f"✅ Auto-play {'enabled' if enabled else 'disabled'}")
+        finally:
+            if conn:
+                conn.close()
 
 async def setup(bot):
     """Setup the Music cog"""
-    cog = Music(bot)
-    await cog.setup_tables()
-    await bot.add_cog(cog)
+    await bot.add_cog(Music(bot))
