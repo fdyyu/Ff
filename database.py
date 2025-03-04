@@ -7,7 +7,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 def get_connection(max_retries: int = 3, timeout: int = 5) -> sqlite3.Connection:
-    """Get SQLite daatabase connection with retry mechanism"""
+    """Get SQLite database connection with retry mechanism"""
     for attempt in range(max_retries):
         try:
             conn = sqlite3.connect('shop.db', timeout=timeout)
@@ -235,6 +235,72 @@ def setup_database():
             )
         """)
 
+        # Music System Tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS music_settings (
+                guild_id TEXT PRIMARY KEY,
+                default_volume INTEGER DEFAULT 100,
+                vote_skip_ratio FLOAT DEFAULT 0.5,
+                max_queue_size INTEGER DEFAULT 500,
+                max_song_duration INTEGER DEFAULT 7200,
+                dj_role TEXT,
+                music_channel TEXT,
+                announce_songs BOOLEAN DEFAULT TRUE,
+                auto_play BOOLEAN DEFAULT FALSE
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS playlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT,
+                name TEXT,
+                owner_id TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(guild_id, name)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS playlist_songs (
+                playlist_id INTEGER,
+                track_url TEXT,
+                track_title TEXT,
+                added_by TEXT,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (playlist_id) REFERENCES playlists (id) ON DELETE CASCADE
+            )
+        """)
+
+        # AutoMod System Tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS automod_settings (
+                guild_id TEXT PRIMARY KEY,
+                enabled BOOLEAN DEFAULT TRUE,
+                spam_threshold INTEGER DEFAULT 5,
+                spam_timeframe INTEGER DEFAULT 5,
+                caps_threshold FLOAT DEFAULT 0.7,
+                caps_min_length INTEGER DEFAULT 10,
+                banned_words TEXT,
+                banned_wildcards TEXT,
+                warn_threshold INTEGER DEFAULT 3,
+                mute_duration INTEGER DEFAULT 10,
+                dj_role TEXT,
+                disabled_channels TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                guild_id TEXT NOT NULL,
+                warning_type TEXT NOT NULL,
+                reason TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Create triggers
         triggers = [
             ("""
@@ -276,6 +342,22 @@ def setup_database():
                 UPDATE role_permissions SET updated_at = CURRENT_TIMESTAMP
                 WHERE role_id = NEW.role_id;
             END;
+            """),
+            ("""
+            CREATE TRIGGER IF NOT EXISTS update_playlists_timestamp 
+            AFTER UPDATE ON playlists
+            BEGIN
+                UPDATE playlists SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+            """),
+            ("""
+            CREATE TRIGGER IF NOT EXISTS update_automod_settings_timestamp 
+            AFTER UPDATE ON automod_settings
+            BEGIN
+                UPDATE automod_settings SET updated_at = CURRENT_TIMESTAMP
+                WHERE guild_id = NEW.guild_id;
+            END;
             """)
         ]
 
@@ -304,7 +386,16 @@ def setup_database():
             ("idx_reputation_guild", "reputation(guild_id)"),
             ("idx_rep_logs_guild", "rep_logs(guild_id)"),
             ("idx_audit_logs_guild", "audit_logs(guild_id)"),
-            ("idx_audit_logs_user", "audit_logs(user_id)")
+            ("idx_audit_logs_user", "audit_logs(user_id)"),
+            # Music system indexes
+            ("idx_music_settings_guild", "music_settings(guild_id)"),
+            ("idx_playlists_guild", "playlists(guild_id)"),
+            ("idx_playlists_owner", "playlists(owner_id)"),
+            ("idx_playlist_songs_playlist", "playlist_songs(playlist_id)"),
+            # AutoMod system indexes
+            ("idx_warnings_user", "warnings(user_id)"),
+            ("idx_warnings_guild", "warnings(guild_id)"),
+            ("idx_automod_settings_guild", "automod_settings(guild_id)")
         ]
 
         for idx_name, idx_cols in indexes:
@@ -352,7 +443,11 @@ def verify_database():
             # Reputation tables
             'reputation', 'rep_logs',
             # Logging tables
-            'logging_settings', 'audit_logs'
+            'logging_settings', 'audit_logs',
+            # Music system tables
+            'music_settings', 'playlists', 'playlist_songs',
+            # AutoMod system tables
+            'automod_settings', 'warnings'
         ]
 
         missing_tables = []
