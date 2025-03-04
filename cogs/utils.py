@@ -3,44 +3,27 @@ from datetime import datetime
 from typing import Optional, Union, Dict, Any
 import logging
 import aiosqlite
+import sqlite3
 
 class DatabaseManager:
-    def __init__(self, db_path: str = "database.db"):
+    def __init__(self, db_path: str = "shop.db"):
         self.db_path = db_path
         self.pool = None
 
     async def initialize(self):
-        self.pool = await aiosqlite.connect(self.db_path)
-        await self.create_tables()
-
-    async def create_tables(self):
-        async with self.pool.cursor() as cursor:
-            # Activity logs table
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS activity_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    activity_type TEXT NOT NULL,
-                    timestamp DATETIME NOT NULL
-                )
-            """)
-            
-            # Warning logs table
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS warnings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL,
-                    guild_id TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    moderator_id TEXT NOT NULL,
-                    timestamp DATETIME NOT NULL
-                )
-            """)
-            
-            await self.pool.commit()
+        """Initialize database connection pool"""
+        try:
+            self.pool = await aiosqlite.connect(self.db_path)
+            await self.pool.execute("PRAGMA foreign_keys = ON")
+            await self.pool.execute("PRAGMA journal_mode = WAL")
+            await self.pool.execute("PRAGMA busy_timeout = 5000")
+            self.pool.row_factory = aiosqlite.Row
+        except Exception as e:
+            logging.error(f"Failed to initialize database: {e}")
+            raise
 
     async def close(self):
+        """Close database connection pool"""
         if self.pool:
             await self.pool.close()
 
@@ -75,24 +58,6 @@ class Embed:
                     embed.add_field(name=field_name, value=value)
                     
         return embed
-
-class Permissions:
-    """Permission checking utilities"""
-    
-    @staticmethod
-    async def check_admin(ctx) -> bool:
-        """Check if user has admin permissions"""
-        if not ctx.guild:
-            return False
-        return ctx.author.guild_permissions.administrator
-
-    @staticmethod
-    async def check_mod(ctx) -> bool:
-        """Check if user has moderator permissions"""
-        if not ctx.guild:
-            return False
-        return (ctx.author.guild_permissions.manage_messages or 
-                ctx.author.guild_permissions.kick_members)
 
 class EventDispatcher:
     """Central event dispatcher"""
