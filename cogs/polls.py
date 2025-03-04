@@ -3,8 +3,8 @@ from discord.ext import commands
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import asyncio
-from .utils import Embed, db, event_dispatcher
-import aiosqlite
+from .utils import Embed, get_connection, logger
+import sqlite3
 from pathlib import Path
 
 class Polls(commands.Cog):
@@ -16,49 +16,91 @@ class Polls(commands.Cog):
         self.emoji_numbers = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", 
                             "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
         
-    async def setup_tables(self):
+    def setup_tables(self):
         """Setup necessary database tables"""
         try:
-            if not hasattr(db, 'pool') or db.pool is None:
-                # Connect to database in same directory as main.py
-                db.pool = await aiosqlite.connect('shop.db')
-                db.pool.row_factory = aiosqlite.Row
+            conn = get_connection()
+            cursor = conn.cursor()
             
-            async with db.pool.cursor() as cursor:
-                # Polls table
-                await cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS polls (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        guild_id TEXT NOT NULL,
-                        channel_id TEXT NOT NULL,
-                        message_id TEXT NOT NULL,
-                        author_id TEXT NOT NULL,
-                        title TEXT NOT NULL,
-                        description TEXT,
-                        options TEXT NOT NULL,
-                        end_time DATETIME,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
+            # Polls table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS polls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    author_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    options TEXT NOT NULL,
+                    end_time DATETIME,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Poll votes table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS poll_votes (
+                    poll_id INTEGER,
+                    user_id TEXT NOT NULL,
+                    option_index INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (poll_id) REFERENCES polls (id) ON DELETE CASCADE,
+                    UNIQUE (poll_id, user_id)
+                )
+            """)
+
+            # Create triggers
+            triggers = [
+                ("""
+                CREATE TRIGGER IF NOT EXISTS update_polls_timestamp 
+                AFTER UPDATE ON polls
+                BEGIN
+                    UPDATE polls SET updated_at = CURRENT_TIMESTAMP
+                    WHERE id = NEW.id;
+                END;
+                """),
+                ("""
+                CREATE TRIGGER IF NOT EXISTS update_poll_votes_timestamp 
+                AFTER UPDATE ON poll_votes
+                BEGIN
+                    UPDATE poll_votes SET updated_at = CURRENT_TIMESTAMP
+                    WHERE poll_id = NEW.poll_id AND user_id = NEW.user_id;
+                END;
                 """)
-                
-                # Poll votes table
-                await cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS poll_votes (
-                        poll_id INTEGER,
-                        user_id TEXT NOT NULL,
-                        option_index INTEGER NOT NULL,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (poll_id) REFERENCES polls (id),
-                        UNIQUE (poll_id, user_id)
-                    )
-                """)
-                
-                await db.pool.commit()
-                print("✅ Polls tables created successfully!")
-        except Exception as e:
-            print(f"❌ Error creating polls tables: {e}")
+            ]
+
+            for trigger in triggers:
+                cursor.execute(trigger)
+
+            # Create indexes
+            indexes = [
+                ("idx_polls_guild", "polls(guild_id)"),
+                ("idx_polls_channel", "polls(channel_id)"),
+                ("idx_polls_message", "polls(message_id)"),
+                ("idx_polls_author", "polls(author_id)"),
+                ("idx_polls_active", "polls(is_active)"),
+                ("idx_poll_votes_poll", "poll_votes(poll_id)"),
+                ("idx_poll_votes_user", "poll_votes(user_id)")
+            ]
+
+            for idx_name, idx_cols in indexes:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_cols}")
+
+            conn.commit()
+            logger.info("Polls tables setup completed successfully")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Error creating polls tables: {e}")
+            if conn:
+                conn.rollback()
             raise
+        finally:
+            if conn:
+                conn.close()
 
     @commands.group(name="poll")
     async def poll(self, ctx):
@@ -128,33 +170,53 @@ class Polls(commands.Cog):
             await poll_msg.add_reaction(self.emoji_numbers[idx])
 
         try:
+            conn = get_connection()
+            cursor = conn.cursor()
+
             # Save to database
-            async with db.pool.cursor() as cursor:
-                await cursor.execute("""
-                    INSERT INTO polls (
-                        guild_id, channel_id, message_id, author_id,
-                        title, options, end_time
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    str(ctx.guild.id),
-                    str(ctx.channel.id),
-                    str(poll_msg.id),
-                    str(ctx.author.id),
-                    title,
-                    ','.join(options),
-                    end_time.strftime('%Y-%m-%d %H:%M:%S') if end_time else None
-                ))
-                poll_id = cursor.lastrowid
-                await db.pool.commit()
+            cursor.execute("""
+                INSERT INTO polls (
+                    guild_id, channel_id, message_id, author_id,
+                    title, options, end_time
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(ctx.guild.id),
+                str(ctx.channel.id),
+                str(poll_msg.id),
+                str(ctx.author.id),
+                title,
+                ','.join(options),
+                end_time.strftime('%Y-%m-%d %H:%M:%S') if end_time else None
+            ))
+            
+            poll_id = cursor.lastrowid
+
+            # Log poll creation
+            cursor.execute("""
+                INSERT INTO admin_logs (admin_id, action, target, details)
+                VALUES (?, ?, ?, ?)
+            """, (
+                str(ctx.author.id),
+                'poll_create',
+                str(poll_msg.id),
+                f"Created poll: {title}"
+            ))
+
+            conn.commit()
 
             # Setup end timer if duration specified
             if end_time:
                 self.active_polls[poll_msg.id] = poll_id
                 await self.schedule_poll_end(poll_msg, end_time)
         
-        except Exception as e:
-            print(f"❌ Error creating poll in database: {e}")
+        except sqlite3.Error as e:
+            logger.error(f"Error creating poll in database: {e}")
             await ctx.send("❌ Failed to create poll!")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
 
     @poll.command(name="end")
     async def end_poll(self, ctx, message_id: int):
@@ -174,14 +236,17 @@ class Polls(commands.Cog):
     async def list_polls(self, ctx):
         """List all active polls in the server"""
         try:
-            async with db.pool.cursor() as cursor:
-                await cursor.execute("""
-                    SELECT id, title, message_id, end_time
-                    FROM polls
-                    WHERE guild_id = ? AND is_active = TRUE
-                    ORDER BY created_at DESC
-                """, (str(ctx.guild.id),))
-                polls = await cursor.fetchall()
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, title, message_id, end_time
+                FROM polls
+                WHERE guild_id = ? AND is_active = TRUE
+                ORDER BY created_at DESC
+            """, (str(ctx.guild.id),))
+            
+            polls = cursor.fetchall()
 
             if not polls:
                 return await ctx.send("❌ No active polls found!")
@@ -207,9 +272,12 @@ class Polls(commands.Cog):
 
             await ctx.send(embed=embed)
         
-        except Exception as e:
-            print(f"❌ Error listing polls: {e}")
+        except sqlite3.Error as e:
+            logger.error(f"Error listing polls: {e}")
             await ctx.send("❌ Failed to list polls!")
+        finally:
+            if conn:
+                conn.close()
 
     async def schedule_poll_end(self, message: discord.Message, end_time: datetime):
         """Schedule a poll to end at the specified time"""
@@ -227,31 +295,45 @@ class Polls(commands.Cog):
         del self.active_polls[message.id]
 
         try:
+            conn = get_connection()
+            cursor = conn.cursor()
+
             # Get poll data
-            async with db.pool.cursor() as cursor:
-                await cursor.execute("""
-                    SELECT title, options FROM polls WHERE id = ?
-                """, (poll_id,))
-                poll_data = await cursor.fetchone()
+            cursor.execute("""
+                SELECT title, options FROM polls WHERE id = ?
+            """, (poll_id,))
+            poll_data = cursor.fetchone()
 
-                if not poll_data:
-                    return
+            if not poll_data:
+                return
 
-                # Get votes
-                await cursor.execute("""
-                    SELECT option_index, COUNT(*) as count
-                    FROM poll_votes
-                    WHERE poll_id = ?
-                    GROUP BY option_index
-                """, (poll_id,))
-                vote_counts = await cursor.fetchall()
+            # Get votes
+            cursor.execute("""
+                SELECT option_index, COUNT(*) as count
+                FROM poll_votes
+                WHERE poll_id = ?
+                GROUP BY option_index
+            """, (poll_id,))
+            vote_counts = cursor.fetchall()
 
-                # Mark poll as inactive
-                await cursor.execute("""
-                    UPDATE polls SET is_active = FALSE
-                    WHERE id = ?
-                """, (poll_id,))
-                await db.pool.commit()
+            # Mark poll as inactive
+            cursor.execute("""
+                UPDATE polls SET is_active = FALSE
+                WHERE id = ?
+            """, (poll_id,))
+
+            # Log poll end
+            cursor.execute("""
+                INSERT INTO admin_logs (admin_id, action, target, details)
+                VALUES (?, ?, ?, ?)
+            """, (
+                str(self.bot.user.id),
+                'poll_end',
+                str(message.id),
+                f"Ended poll: {poll_data['title']}"
+            ))
+
+            conn.commit()
 
             options = poll_data['options'].split(',')
             vote_data = {row['option_index']: row['count'] for row in vote_counts}
@@ -279,8 +361,13 @@ class Polls(commands.Cog):
             await message.edit(embed=embed)
             await message.clear_reactions()
         
-        except Exception as e:
-            print(f"❌ Error ending poll: {e}")
+        except sqlite3.Error as e:
+            logger.error(f"Error ending poll: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
             
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
@@ -299,13 +386,16 @@ class Polls(commands.Cog):
         poll_id = self.active_polls[payload.message_id]
 
         try:
+            conn = get_connection()
+            cursor = conn.cursor()
+
             # Record vote
-            async with db.pool.cursor() as cursor:
-                await cursor.execute("""
-                    INSERT OR REPLACE INTO poll_votes (poll_id, user_id, option_index)
-                    VALUES (?, ?, ?)
-                """, (poll_id, str(payload.user_id), emoji_idx))
-                await db.pool.commit()
+            cursor.execute("""
+                INSERT OR REPLACE INTO poll_votes (poll_id, user_id, option_index)
+                VALUES (?, ?, ?)
+            """, (poll_id, str(payload.user_id), emoji_idx))
+
+            conn.commit()
 
             # Remove other reactions from this user
             channel = self.bot.get_channel(payload.channel_id)
@@ -316,11 +406,16 @@ class Polls(commands.Cog):
                 if str(reaction.emoji) != str(payload.emoji):
                     await reaction.remove(member)
         
-        except Exception as e:
-            print(f"❌ Error recording vote: {e}")
+        except sqlite3.Error as e:
+            logger.error(f"Error recording vote: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
 
 async def setup(bot):
     """Setup the Polls cog"""
     cog = Polls(bot)
-    await cog.setup_tables()
+    cog.setup_tables()
     await bot.add_cog(cog)
