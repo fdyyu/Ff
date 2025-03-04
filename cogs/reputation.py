@@ -1,9 +1,14 @@
 import discord
 from discord.ext import commands
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
-from .utils import Embed, db, event_dispatcher
+from .utils import Embed, event_dispatcher
+from database import get_connection
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Reputation(commands.Cog):
     """⭐ Advanced Reputation System"""
@@ -13,11 +18,15 @@ class Reputation(commands.Cog):
         self.cooldowns = {}
         self.register_handlers()
 
-    async def setup_tables(self):
+    def setup_tables(self):
         """Setup necessary database tables"""
-        async with db.pool.cursor() as cursor:
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
             # Reputation settings
-            await cursor.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS reputation_settings (
                     guild_id TEXT PRIMARY KEY,
                     cooldown INTEGER DEFAULT 43200,
@@ -34,7 +43,7 @@ class Reputation(commands.Cog):
             """)
             
             # User reputation
-            await cursor.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS user_reputation (
                     user_id TEXT,
                     guild_id TEXT,
@@ -48,7 +57,7 @@ class Reputation(commands.Cog):
             """)
             
             # Reputation history
-            await cursor.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS reputation_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id TEXT NOT NULL,
@@ -62,7 +71,7 @@ class Reputation(commands.Cog):
             """)
             
             # Reputation roles
-            await cursor.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS reputation_roles (
                     guild_id TEXT,
                     reputation INTEGER,
@@ -71,7 +80,17 @@ class Reputation(commands.Cog):
                 )
             """)
             
-            await db.pool.commit()
+            conn.commit()
+            logger.info("Reputation tables created successfully")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to setup reputation tables: {e}")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                conn.close()
 
     def register_handlers(self):
         """Register event handlers"""
@@ -79,13 +98,17 @@ class Reputation(commands.Cog):
         event_dispatcher.register('rep_remove', self.log_reputation)
         event_dispatcher.register('rep_reset', self.log_reputation)
 
-    async def get_settings(self, guild_id: int) -> Dict:
+    def get_settings(self, guild_id: int) -> Dict:
         """Get reputation settings for a guild"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT * FROM reputation_settings WHERE guild_id = ?
             """, (str(guild_id),))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             
             if not data:
                 default_settings = {
@@ -101,56 +124,73 @@ class Reputation(commands.Cog):
                     'decay_days': 30
                 }
                 
-                await cursor.execute("""
+                cursor.execute("""
                     INSERT INTO reputation_settings
                     (guild_id, cooldown, max_daily)
                     VALUES (?, ?, ?)
                 """, (str(guild_id), 43200, 3))
-                await db.pool.commit()
+                conn.commit()
                 return default_settings
                 
             return dict(data)
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to get reputation settings: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
 
     async def check_reputation_roles(self, member: discord.Member, reputation: int):
         """Check and update reputation roles"""
-        settings = await self.get_settings(member.guild.id)
+        settings = self.get_settings(member.guild.id)
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT role_id, reputation FROM reputation_roles
                 WHERE guild_id = ? AND reputation <= ?
                 ORDER BY reputation DESC
             """, (str(member.guild.id), reputation))
-            role_data = await cursor.fetchall()
+            role_data = cursor.fetchall()
             
-        if not role_data:
-            return
-            
-        try:
-            if settings['stack_roles']:
-                # Add all roles up to current reputation
-                for data in role_data:
-                    role = member.guild.get_role(int(data['role_id']))
-                    if role and role not in member.roles:
-                        await member.add_roles(role)
-            else:
-                # Only add highest role
-                highest_role = member.guild.get_role(int(role_data[0]['role_id']))
-                if highest_role:
-                    # Remove other reputation roles
-                    for data in role_data[1:]:
+            if not role_data:
+                return
+                
+            try:
+                if settings['stack_roles']:
+                    # Add all roles up to current reputation
+                    for data in role_data:
                         role = member.guild.get_role(int(data['role_id']))
-                        if role and role in member.roles:
-                            await member.remove_roles(role)
-                    # Add highest role
-                    if highest_role not in member.roles:
-                        await member.add_roles(highest_role)
-        except discord.Forbidden:
-            pass
+                        if role and role not in member.roles:
+                            await member.add_roles(role)
+                else:
+                    # Only add highest role
+                    highest_role = member.guild.get_role(int(role_data[0]['role_id']))
+                    if highest_role:
+                        # Remove other reputation roles
+                        for data in role_data[1:]:
+                            role = member.guild.get_role(int(data['role_id']))
+                            if role and role in member.roles:
+                                await member.remove_roles(role)
+                        # Add highest role
+                        if highest_role not in member.roles:
+                            await member.add_roles(highest_role)
+            except discord.Forbidden:
+                pass
+                
+        except sqlite3.Error as e:
+            logger.error(f"Failed to check reputation roles: {e}")
+        finally:
+            if conn:
+                conn.close()
 
     async def log_reputation(self, guild: discord.Guild, giver: discord.Member, receiver: discord.Member, action: str, amount: int, reason: str = None):
         """Log reputation changes"""
-        settings = await self.get_settings(guild.id)
+        settings = self.get_settings(guild.id)
         if not settings['log_channel']:
             return
             
@@ -187,7 +227,7 @@ class Reputation(commands.Cog):
         if member.bot:
             return await ctx.send("❌ You can't give reputation to bots!")
             
-        settings = await self.get_settings(ctx.guild.id)
+        settings = self.get_settings(ctx.guild.id)
         
         # Check required role
         if settings['required_role']:
@@ -210,20 +250,24 @@ class Reputation(commands.Cog):
             if remaining.total_seconds() > 0:
                 return await ctx.send(f"❌ You must wait {int(remaining.total_seconds() // 60)} minutes before giving reputation again!")
         
-        async with db.pool.cursor() as cursor:
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
             # Check daily limit
-            await cursor.execute("""
+            cursor.execute("""
                 SELECT COUNT(*) as count FROM reputation_history
                 WHERE guild_id = ? AND giver_id = ? 
                 AND timestamp > datetime('now', '-1 day')
             """, (str(ctx.guild.id), str(ctx.author.id)))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             
             if data['count'] >= settings['max_daily']:
                 return await ctx.send("❌ You've reached your daily reputation limit!")
             
             # Update reputation
-            await cursor.execute("""
+            cursor.execute("""
                 INSERT INTO user_reputation (user_id, guild_id, reputation, total_received)
                 VALUES (?, ?, 1, 1)
                 ON CONFLICT(user_id, guild_id) DO UPDATE SET
@@ -233,7 +277,7 @@ class Reputation(commands.Cog):
             """, (str(member.id), str(ctx.guild.id)))
             
             # Update giver stats
-            await cursor.execute("""
+            cursor.execute("""
                 INSERT INTO user_reputation (user_id, guild_id, total_given)
                 VALUES (?, ?, 1)
                 ON CONFLICT(user_id, guild_id) DO UPDATE SET
@@ -242,7 +286,7 @@ class Reputation(commands.Cog):
             """, (str(ctx.author.id), str(ctx.guild.id)))
             
             # Record history
-            await cursor.execute("""
+            cursor.execute("""
                 INSERT INTO reputation_history
                 (guild_id, giver_id, receiver_id, message_id, reason, amount)
                 VALUES (?, ?, ?, ?, ?, 1)
@@ -254,27 +298,29 @@ class Reputation(commands.Cog):
                 reason
             ))
             
-            await db.pool.commit()
+            conn.commit()
             
-        # Set cooldown
-        self.cooldowns[cooldown_key] = datetime.utcnow() + timedelta(seconds=settings['cooldown'])
-        
-        # Get new reputation
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+            # Set cooldown
+            self.cooldowns[cooldown_key] = datetime.utcnow() + timedelta(seconds=settings['cooldown'])
+            
+            # Get new reputation
+            cursor.execute("""
                 SELECT reputation FROM user_reputation
                 WHERE user_id = ? AND guild_id = ?
             """, (str(member.id), str(ctx.guild.id)))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             new_rep = data['reputation']
-        
-        # Check roles
-        await self.check_reputation_roles(member, new_rep)
-        
-        # Log action
-        await self.log_reputation(ctx.guild, ctx.author, member, "Give", 1, reason)
-        
-        await ctx.send(f"✅ Gave reputation to {member.mention}! Their new reputation is {new_rep} ⭐")
+            
+            await self.check_reputation_roles(member, new_rep)
+            await self.log_reputation(ctx.guild, ctx.author, member, "Give", 1, reason)
+            await ctx.send(f"✅ Gave reputation to {member.mention}! Their new reputation is {new_rep} ⭐")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to give reputation: {e}")
+            await ctx.send("❌ An error occurred while giving reputation")
+        finally:
+            if conn:
+                conn.close()
 
     @rep.command(name="remove", aliases=["-"])
     @commands.has_permissions(manage_guild=True)
@@ -283,15 +329,19 @@ class Reputation(commands.Cog):
         if amount < 1:
             return await ctx.send("❌ Amount must be positive!")
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE user_reputation
                 SET reputation = MAX(0, reputation - ?)
                 WHERE user_id = ? AND guild_id = ?
             """, (amount, str(member.id), str(ctx.guild.id)))
             
             # Record history
-            await cursor.execute("""
+            cursor.execute("""
                 INSERT INTO reputation_history
                 (guild_id, giver_id, receiver_id, reason, amount)
                 VALUES (?, ?, ?, ?, ?)
@@ -303,46 +353,53 @@ class Reputation(commands.Cog):
                 -amount
             ))
             
-            await db.pool.commit()
+            conn.commit()
             
             # Get new reputation
-            await cursor.execute("""
+            cursor.execute("""
                 SELECT reputation FROM user_reputation
                 WHERE user_id = ? AND guild_id = ?
             """, (str(member.id), str(ctx.guild.id)))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             new_rep = data['reputation'] if data else 0
             
-        # Check roles
-        await self.check_reputation_roles(member, new_rep)
-        
-        # Log action
-        await self.log_reputation(ctx.guild, ctx.author, member, "Remove", amount, reason)
-        
-        await ctx.send(f"✅ Removed {amount} reputation from {member.mention}! Their new reputation is {new_rep} ⭐")
+            await self.check_reputation_roles(member, new_rep)
+            await self.log_reputation(ctx.guild, ctx.author, member, "Remove", amount, reason)
+            await ctx.send(f"✅ Removed {amount} reputation from {member.mention}! Their new reputation is {new_rep} ⭐")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to remove reputation: {e}")
+            await ctx.send("❌ An error occurred while removing reputation")
+        finally:
+            if conn:
+                conn.close()
 
     @rep.command(name="check")
     async def check_rep(self, ctx, member: discord.Member = None):
         """Check your or someone else's reputation"""
         member = member or ctx.author
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT * FROM user_reputation
                 WHERE user_id = ? AND guild_id = ?
             """, (str(member.id), str(ctx.guild.id)))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             
             if not data:
                 return await ctx.send("❌ This user has no reputation yet!")
                 
             # Get rank
-            await cursor.execute("""
+            cursor.execute("""
                 SELECT COUNT(*) as rank
                 FROM user_reputation
                 WHERE guild_id = ? AND reputation > ?
             """, (str(ctx.guild.id), data['reputation']))
-            rank_data = await cursor.fetchone()
+            rank_data = cursor.fetchone()
             
             rank = rank_data['rank'] + 1
             
@@ -362,84 +419,113 @@ class Reputation(commands.Cog):
                 )
                 
             await ctx.send(embed=embed)
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to check reputation: {e}")
+            await ctx.send("❌ An error occurred while checking reputation")
+        finally:
+            if conn:
+                conn.close()
 
     @rep.command(name="top")
     async def top_rep(self, ctx):
         """Show reputation leaderboard"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT user_id, reputation
                 FROM user_reputation
                 WHERE guild_id = ?
                 ORDER BY reputation DESC
                 LIMIT 10
             """, (str(ctx.guild.id),))
-            top_users = await cursor.fetchall()
+            top_users = cursor.fetchall()
             
-        if not top_users:
-            return await ctx.send("❌ No one has any reputation yet!")
-            
-        embed = Embed.create(
-            title=f"⭐ {ctx.guild.name}'s Top Members",
-            color=discord.Color.gold()
-        )
-        
-        for idx, user_data in enumerate(top_users, 1):
-            member = ctx.guild.get_member(int(user_data['user_id']))
-            if member:
-                embed.add_field(
-                    name=f"#{idx} {member.display_name}",
-                    value=f"{user_data['reputation']} ⭐",
-                    inline=False
-                )
+            if not top_users:
+                return await ctx.send("❌ No one has any reputation yet!")
                 
-        await ctx.send(embed=embed)
+            embed = Embed.create(
+                title=f"⭐ {ctx.guild.name}'s Top Members",
+                color=discord.Color.gold()
+            )
+            
+            for idx, user_data in enumerate(top_users, 1):
+                member = ctx.guild.get_member(int(user_data['user_id']))
+                if member:
+                    embed.add_field(
+                        name=f"#{idx} {member.display_name}",
+                        value=f"{user_data['reputation']} ⭐",
+                        inline=False
+                    )
+                    
+            await ctx.send(embed=embed)
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to get reputation leaderboard: {e}")
+            await ctx.send("❌ An error occurred while getting the leaderboard")
+        finally:
+            if conn:
+                conn.close()
 
     @rep.command(name="history")
     async def rep_history(self, ctx, member: discord.Member = None):
         """View reputation history"""
         member = member or ctx.author
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT * FROM reputation_history
                 WHERE (giver_id = ? OR receiver_id = ?) AND guild_id = ?
                 ORDER BY timestamp DESC LIMIT 10
             """, (str(member.id), str(member.id), str(ctx.guild.id)))
-            history = await cursor.fetchall()
+            history = cursor.fetchall()
             
-        if not history:
-            return await ctx.send("❌ No reputation history found!")
-            
-        embed = Embed.create(
-            title=f"⭐ Reputation History - {member.display_name}",
-            color=member.color
-        )
-        
-        for entry in history:
-            giver = ctx.guild.get_member(int(entry['giver_id']))
-            receiver = ctx.guild.get_member(int(entry['receiver_id']))
-            
-            if giver and receiver:
-                timestamp = datetime.strptime(entry['timestamp'], '%Y-%m-%d %H:%M:%S')
-                action = "Received" if entry['receiver_id'] == str(member.id) else "Gave"
-                target = giver if action == "Received" else receiver
+            if not history:
+                return await ctx.send("❌ No reputation history found!")
                 
-                embed.add_field(
-                    name=f"{action} {abs(entry['amount'])} ⭐ {discord.utils.format_dt(timestamp, 'R')}",
-                    value=f"{'From' if action == 'Received' else 'To'}: {target.mention}\n"
-                          f"Reason: {entry['reason'] or 'No reason provided'}",
-                    inline=False
-                )
+            embed = Embed.create(
+                title=f"⭐ Reputation History - {member.display_name}",
+                color=member.color
+            )
+            
+            for entry in history:
+                giver = ctx.guild.get_member(int(entry['giver_id']))
+                receiver = ctx.guild.get_member(int(entry['receiver_id']))
                 
-        await ctx.send(embed=embed)
+                if giver and receiver:
+                    timestamp = datetime.strptime(entry['timestamp'], '%Y-%m-%d %H:%M:%S')
+                    action = "Received" if entry['receiver_id'] == str(member.id) else "Gave"
+                    target = giver if action == "Received" else receiver
+                    
+                    embed.add_field(
+                        name=f"{action} {abs(entry['amount'])} ⭐ {discord.utils.format_dt(timestamp, 'R')}",
+                        value=f"{'From' if action == 'Received' else 'To'}: {target.mention}\n"
+                              f"Reason: {entry['reason'] or 'No reason provided'}",
+                        inline=False
+                    )
+                    
+            await ctx.send(embed=embed)
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to get reputation history: {e}")
+            await ctx.send("❌ An error occurred while getting the history")
+        finally:
+            if conn:
+                conn.close()
 
     @commands.group(name="repset")
     @commands.has_permissions(manage_guild=True)
     async def repset(self, ctx):
         """⚙️ Reputation system settings"""
         if ctx.invoked_subcommand is None:
-            settings = await self.get_settings(ctx.guild.id)
+            settings = self.get_settings(ctx.guild.id)
             
             embed = Embed.create(
                 title="⚙️ Reputation Settings",
@@ -462,15 +548,26 @@ class Reputation(commands.Cog):
         if hours < 1:
             return await ctx.send("❌ Cooldown must be at least 1 hour!")
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE reputation_settings
                 SET cooldown = ?
                 WHERE guild_id = ?
             """, (hours * 3600, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Reputation cooldown set to {hours} hours")
+            await ctx.send(f"✅ Reputation cooldown set to {hours} hours")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to set cooldown: {e}")
+            await ctx.send("❌ An error occurred while setting the cooldown")
+        finally:
+            if conn:
+                conn.close()
 
     @repset.command(name="maxdaily")
     async def set_max_daily(self, ctx, amount: int):
@@ -478,15 +575,26 @@ class Reputation(commands.Cog):
         if amount < 1:
             return await ctx.send("❌ Amount must be positive!")
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE reputation_settings
                 SET max_daily = ?
                 WHERE guild_id = ?
             """, (amount, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Maximum daily reputation gives set to {amount}")
+            await ctx.send(f"✅ Maximum daily reputation gives set to {amount}")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to set max daily: {e}")
+            await ctx.send("❌ An error occurred while setting the daily limit")
+        finally:
+            if conn:
+                conn.close()
 
     @repset.command(name="addrole")
     async def add_rep_role(self, ctx, role: discord.Role, required_rep: int):
@@ -494,106 +602,83 @@ class Reputation(commands.Cog):
         if required_rep < 0:
             return await ctx.send("❌ Required reputation must be positive!")
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 INSERT OR REPLACE INTO reputation_roles
                 (guild_id, reputation, role_id)
                 VALUES (?, ?, ?)
             """, (str(ctx.guild.id), required_rep, str(role.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ {role.mention} will be given at {required_rep} reputation")
+            await ctx.send(f"✅ {role.mention} will be given at {required_rep} reputation")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to add reputation role: {e}")
+            await ctx.send("❌ An error occurred while adding the role")
+        finally:
+            if conn:
+                conn.close()
 
     @repset.command(name="removerole")
     async def remove_rep_role(self, ctx, role: discord.Role):
         """Remove a reputation role reward"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 DELETE FROM reputation_roles
                 WHERE guild_id = ? AND role_id = ?
             """, (str(ctx.guild.id), str(role.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Removed {role.mention} from reputation rewards")
+            await ctx.send(f"✅ Removed {role.mention} from reputation rewards")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to remove reputation role: {e}")
+            await ctx.send("❌ An error occurred while removing the role")
+        finally:
+            if conn:
+                conn.close()
 
     @repset.command(name="stackroles")
     async def toggle_stack_roles(self, ctx):
         """Toggle stacking of reputation roles"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE reputation_settings
                 SET stack_roles = NOT stack_roles
                 WHERE guild_id = ?
             """, (str(ctx.guild.id),))
-            await db.pool.commit()
+            conn.commit()
             
-            await cursor.execute("""
+            cursor.execute("""
                 SELECT stack_roles FROM reputation_settings
                 WHERE guild_id = ?
             """, (str(ctx.guild.id),))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             
-        enabled = data['stack_roles']
-        await ctx.send(f"✅ Role stacking {'enabled' if enabled else 'disabled'}")
-
-    @repset.command(name="decay")
-    async def toggle_decay(self, ctx, days: int = None):
-        """Toggle reputation decay and set decay period"""
-        if days is not None:
-            if days < 1:
-                return await ctx.send("❌ Days must be positive!")
-                
-            async with db.pool.cursor() as cursor:
-                await cursor.execute("""
-                    UPDATE reputation_settings
-                    SET decay_enabled = TRUE, decay_days = ?
-                    WHERE guild_id = ?
-                """, (days, str(ctx.guild.id)))
-                await db.pool.commit()
-                
-            await ctx.send(f"✅ Reputation decay enabled with {days} days period")
-        else:
-            async with db.pool.cursor() as cursor:
-                await cursor.execute("""
-                    UPDATE reputation_settings
-                    SET decay_enabled = NOT decay_enabled
-                    WHERE guild_id = ?
-                """, (str(ctx.guild.id),))
-                await db.pool.commit()
-                
-                await cursor.execute("""
-                    SELECT decay_enabled FROM reputation_settings
-                    WHERE guild_id = ?
-                """, (str(ctx.guild.id),))
-                data = await cursor.fetchone()
-                
-            enabled = data['decay_enabled']
-            await ctx.send(f"✅ Reputation decay {'enabled' if enabled else 'disabled'}")
-
-    @tasks.loop(hours=24)
-    async def decay_reputation(self):
-        """Daily reputation decay task"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
-                SELECT guild_id, decay_days FROM reputation_settings
-                WHERE decay_enabled = TRUE
-            """)
-            guilds = await cursor.fetchall()
+            enabled = data['stack_roles']
+            await ctx.send(f"✅ Role stacking {'enabled' if enabled else 'disabled'}")
             
-            for guild in guilds:
-                await cursor.execute("""
-                    UPDATE user_reputation
-                    SET reputation = CASE
-                        WHEN last_received < datetime('now', ?) THEN MAX(0, reputation - 1)
-                        ELSE reputation
-                    END
-                    WHERE guild_id = ?
-                """, (f"-{guild['decay_days']} days", guild['guild_id']))
-                
-            await db.pool.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to toggle role stacking: {e}")
+            await ctx.send("❌ An error occurred while toggling role stacking")
+        finally:
+            if conn:
+                conn.close()
 
 async def setup(bot):
     """Setup the Reputation cog"""
     cog = Reputation(bot)
-    await cog.setup_tables()
+    cog.setup_tables()  # Not async anymore since using sqlite3
     await bot.add_cog(cog)
