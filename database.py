@@ -505,7 +505,61 @@ def setup_database():
                     UNIQUE(guild_id, name)
                 )
             """)
-
+            # 10. Giveaway System Tables
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS giveaways (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    host_id TEXT NOT NULL,
+                    prize TEXT NOT NULL,
+                    winners INTEGER DEFAULT 1,
+                    entries INTEGER DEFAULT 0,
+                    requirements TEXT,
+                    end_time DATETIME NOT NULL,
+                    ended BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS giveaway_entries (
+                    giveaway_id INTEGER,
+                    user_id TEXT NOT NULL,
+                    entries INTEGER DEFAULT 1,
+                    entered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (giveaway_id, user_id),
+                    FOREIGN KEY (giveaway_id) REFERENCES giveaways (id) ON DELETE CASCADE
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS giveaway_settings (
+                    guild_id TEXT PRIMARY KEY,
+                    manager_role TEXT,
+                    default_duration INTEGER DEFAULT 86400,
+                    minimum_duration INTEGER DEFAULT 300,
+                    maximum_duration INTEGER DEFAULT 2592000,
+                    maximum_winners INTEGER DEFAULT 20,
+                    bypass_roles TEXT,
+                    required_roles TEXT,
+                    blacklisted_roles TEXT
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS level_settings (
+                    guild_id TEXT PRIMARY KEY,
+                    min_xp INTEGER DEFAULT 15,
+                    max_xp INTEGER DEFAULT 25,
+                    cooldown INTEGER DEFAULT 60,
+                    announcement_channel TEXT,
+                    level_up_message TEXT DEFAULT 'Congratulations {user}! You reached level {level}!',
+                    stack_roles BOOLEAN DEFAULT FALSE,
+                    ignore_bots BOOLEAN DEFAULT TRUE
+                )
+            """)
 
             # Create triggers for timestamp updates
             triggers = [
@@ -628,7 +682,16 @@ def setup_database():
                 ("idx_activity_logs_timestamp", "activity_logs(timestamp)"),
                 ("idx_member_history_guild", "member_history(guild_id)"),
                 ("idx_member_history_timestamp", "member_history(timestamp)"),
-
+                # Giveaway System Indexes
+                ("idx_giveaways_guild", "giveaways(guild_id)"),
+                ("idx_giveaways_channel", "giveaways(channel_id)"),
+                ("idx_giveaways_message", "giveaways(message_id)"),
+                ("idx_giveaways_host", "giveaways(host_id)"),
+                ("idx_giveaways_end_time", "giveaways(end_time)"),
+                ("idx_giveaway_entries_giveaway", "giveaway_entries(giveaway_id)"),
+                ("idx_giveaway_entries_user", "giveaway_entries(user_id)"),
+                ("idx_giveaway_settings_guild", "giveaway_settings(guild_id)"),
+                ("idx_level_settings_guild", "level_settings(guild_id)"),
                 # Poll System Indexes
                 ("idx_polls_guild", "polls(guild_id)"),
                 ("idx_polls_channel", "polls(channel_id)"),
@@ -769,6 +832,10 @@ def verify_database():
             'ticket_settings', 'tickets', 'ticket_responses'
             # Di bagian tables list, tambahkan:
             'reminder_settings', 'reminders', 'reminder_templates',
+            # Giveaway System Tables
+            'giveaways', 'giveaway_entries', 'giveaway_settings',
+            # Additional Level System Tables
+            'level_settings',
         ]
 
         missing_tables = []
