@@ -3,7 +3,12 @@ from discord.ext import commands
 import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .utils import Embed, db, event_dispatcher
+from .utils import Embed, event_dispatcher
+from database import get_connection
+import sqlite3
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Management(commands.Cog):
     """⚙️ Advanced Server Management System"""
@@ -12,11 +17,15 @@ class Management(commands.Cog):
         self.bot = bot
         self.register_handlers()
 
-    async def setup_tables(self):
+    def setup_tables(self):
         """Setup necessary database tables"""
-        async with db.pool.cursor() as cursor:
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
             # Server settings
-            await cursor.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS server_settings (
                     guild_id TEXT PRIMARY KEY,
                     prefix TEXT DEFAULT '!',
@@ -33,7 +42,7 @@ class Management(commands.Cog):
             """)
             
             # Channel permissions
-            await cursor.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS channel_permissions (
                     guild_id TEXT,
                     channel_id TEXT,
@@ -45,7 +54,7 @@ class Management(commands.Cog):
             """)
             
             # Scheduled tasks
-            await cursor.execute("""
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS scheduled_tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id TEXT,
@@ -57,7 +66,17 @@ class Management(commands.Cog):
                 )
             """)
             
-            await db.pool.commit()
+            conn.commit()
+            logger.info("Management tables created successfully")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to setup management tables: {e}")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                conn.close()
 
     def register_handlers(self):
         """Register event handlers"""
@@ -65,13 +84,17 @@ class Management(commands.Cog):
         event_dispatcher.register('channel_update', self.log_channel_change)
         event_dispatcher.register('permission_update', self.log_permission_change)
 
-    async def get_settings(self, guild_id: int) -> Dict:
+    def get_settings(self, guild_id: int) -> Dict:
         """Get server settings"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT * FROM server_settings WHERE guild_id = ?
             """, (str(guild_id),))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             
             if not data:
                 default_settings = {
@@ -87,21 +110,27 @@ class Management(commands.Cog):
                     'verification_required': False
                 }
                 
-                await cursor.execute("""
+                cursor.execute("""
                     INSERT INTO server_settings (guild_id, prefix)
                     VALUES (?, ?)
                 """, (str(guild_id), '!'))
-                await db.pool.commit()
+                conn.commit()
                 return default_settings
                 
             return dict(data)
+        except sqlite3.Error as e:
+            logger.error(f"Failed to get server settings: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
 
     @commands.group(name="config")
     @commands.has_permissions(administrator=True)
     async def config(self, ctx):
         """⚙️ Server configuration commands"""
         if ctx.invoked_subcommand is None:
-            settings = await self.get_settings(ctx.guild.id)
+            settings = self.get_settings(ctx.guild.id)
             
             embed = Embed.create(
                 title="⚙️ Server Configuration",
@@ -122,34 +151,56 @@ class Management(commands.Cog):
         """Set server prefix"""
         if len(prefix) > 5:
             return await ctx.send("❌ Prefix must be 5 characters or less!")
+        
+        conn = None    
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+            cursor.execute("""
                 UPDATE server_settings
                 SET prefix = ?
                 WHERE guild_id = ?
             """, (prefix, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Prefix set to `{prefix}`")
+            await ctx.send(f"✅ Prefix set to `{prefix}`")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to set prefix: {e}")
+            await ctx.send("❌ An error occurred while setting the prefix")
+        finally:
+            if conn:
+                conn.close()
 
     @config.command(name="autorole")
     async def set_auto_role(self, ctx, role: discord.Role = None):
         """Set auto-role for new members"""
         role_id = str(role.id) if role else None
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE server_settings
                 SET auto_role = ?
                 WHERE guild_id = ?
             """, (role_id, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        if role:
-            await ctx.send(f"✅ Auto-role set to {role.mention}")
-        else:
-            await ctx.send("✅ Auto-role disabled")
+            if role:
+                await ctx.send(f"✅ Auto-role set to {role.mention}")
+            else:
+                await ctx.send("✅ Auto-role disabled")
+                
+        except sqlite3.Error as e:
+            logger.error(f"Failed to set auto-role: {e}")
+            await ctx.send("❌ An error occurred while setting the auto-role")
+        finally:
+            if conn:
+                conn.close()
 
     @config.command(name="muterole")
     async def set_mute_role(self, ctx, role: discord.Role = None):
@@ -164,71 +215,115 @@ class Management(commands.Cog):
                     
         role_id = str(role.id) if role else None
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE server_settings
                 SET mute_role = ?
                 WHERE guild_id = ?
             """, (role_id, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        if role:
-            await ctx.send(f"✅ Mute role set to {role.mention}")
-        else:
-            await ctx.send("✅ Mute role disabled")
+            if role:
+                await ctx.send(f"✅ Mute role set to {role.mention}")
+            else:
+                await ctx.send("✅ Mute role disabled")
+                
+        except sqlite3.Error as e:
+            logger.error(f"Failed to set mute role: {e}")
+            await ctx.send("❌ An error occurred while setting the mute role")
+        finally:
+            if conn:
+                conn.close()
 
     @config.command(name="modrole")
     async def set_mod_role(self, ctx, role: discord.Role = None):
         """Set moderator role"""
         role_id = str(role.id) if role else None
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE server_settings
                 SET mod_role = ?
                 WHERE guild_id = ?
             """, (role_id, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        if role:
-            await ctx.send(f"✅ Moderator role set to {role.mention}")
-        else:
-            await ctx.send("✅ Moderator role disabled")
+            if role:
+                await ctx.send(f"✅ Moderator role set to {role.mention}")
+            else:
+                await ctx.send("✅ Moderator role disabled")
+                
+        except sqlite3.Error as e:
+            logger.error(f"Failed to set mod role: {e}")
+            await ctx.send("❌ An error occurred while setting the moderator role")
+        finally:
+            if conn:
+                conn.close()
 
     @config.command(name="adminrole")
     async def set_admin_role(self, ctx, role: discord.Role = None):
         """Set administrator role"""
         role_id = str(role.id) if role else None
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE server_settings
                 SET admin_role = ?
                 WHERE guild_id = ?
             """, (role_id, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        if role:
-            await ctx.send(f"✅ Administrator role set to {role.mention}")
-        else:
-            await ctx.send("✅ Administrator role disabled")
+            if role:
+                await ctx.send(f"✅ Administrator role set to {role.mention}")
+            else:
+                await ctx.send("✅ Administrator role disabled")
+                
+        except sqlite3.Error as e:
+            logger.error(f"Failed to set admin role: {e}")
+            await ctx.send("❌ An error occurred while setting the administrator role")
+        finally:
+            if conn:
+                conn.close()
 
     @config.command(name="verification")
     async def toggle_verification(self, ctx, required: bool = None):
         """Toggle member verification requirement"""
         if required is None:
-            settings = await self.get_settings(ctx.guild.id)
+            settings = self.get_settings(ctx.guild.id)
             required = not settings['verification_required']
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE server_settings
                 SET verification_required = ?
                 WHERE guild_id = ?
             """, (required, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Verification requirement {'enabled' if required else 'disabled'}")
+            await ctx.send(f"✅ Verification requirement {'enabled' if required else 'disabled'}")
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to toggle verification: {e}")
+            await ctx.send("❌ An error occurred while updating verification settings")
+        finally:
+            if conn:
+                conn.close()
 
     @config.command(name="joinage")
     async def set_join_age(self, ctx, days: int):
@@ -236,18 +331,29 @@ class Management(commands.Cog):
         if days < 0:
             return await ctx.send("❌ Days must be 0 or positive!")
             
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 UPDATE server_settings
                 SET join_age = ?
                 WHERE guild_id = ?
             """, (days, str(ctx.guild.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        if days > 0:
-            await ctx.send(f"✅ Minimum account age set to {days} days")
-        else:
-            await ctx.send("✅ Account age requirement disabled")
+            if days > 0:
+                await ctx.send(f"✅ Minimum account age set to {days} days")
+            else:
+                await ctx.send("✅ Account age requirement disabled")
+                
+        except sqlite3.Error as e:
+            logger.error(f"Failed to set join age: {e}")
+            await ctx.send("❌ An error occurred while setting the join age")
+        finally:
+            if conn:
+                conn.close()
 
     @commands.group(name="channel")
     @commands.has_permissions(manage_channels=True)
@@ -335,6 +441,12 @@ class Management(commands.Cog):
         if amount < 1:
             return await ctx.send("❌ Amount must be positive!")
             
+    @clean.command(name="bots")
+    async def clean_bot_messages(self, ctx, amount: int = 100):
+        """Clean bot messages"""
+        if amount < 1:
+            return await ctx.send("❌ Amount must be positive!")
+            
         def check(msg):
             return msg.author.bot
             
@@ -346,7 +458,7 @@ class Management(commands.Cog):
 
     async def log_role_change(self, guild: discord.Guild, role: discord.Role, action: str):
         """Log role changes"""
-        settings = await self.get_settings(guild.id)
+        settings = self.get_settings(guild.id)
         if not settings['log_channel']:
             return
             
@@ -365,7 +477,7 @@ class Management(commands.Cog):
 
     async def log_channel_change(self, guild: discord.Guild, channel: discord.abc.GuildChannel, action: str):
         """Log channel changes"""
-        settings = await self.get_settings(guild.id)
+        settings = self.get_settings(guild.id)
         if not settings['log_channel']:
             return
             
@@ -384,7 +496,7 @@ class Management(commands.Cog):
 
     async def log_permission_change(self, guild: discord.Guild, target: str, action: str):
         """Log permission changes"""
-        settings = await self.get_settings(guild.id)
+        settings = self.get_settings(guild.id)
         if not settings['log_channel']:
             return
             
@@ -404,5 +516,5 @@ class Management(commands.Cog):
 async def setup(bot):
     """Setup the Management cog"""
     cog = Management(bot)
-    await cog.setup_tables()
+    cog.setup_tables()  # Not async anymore since using sqlite3
     await bot.add_cog(cog)
