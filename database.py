@@ -33,6 +33,36 @@ def setup_database():
     try:
         conn = get_connection()
         cursor = conn.cursor()
+        
+        # Polling System Tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS polls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                options TEXT NOT NULL,
+                end_time DATETIME,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS poll_votes (
+                poll_id INTEGER,
+                user_id TEXT NOT NULL,
+                option_index INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (poll_id) REFERENCES polls (id) ON DELETE CASCADE,
+                UNIQUE (poll_id, user_id)
+            )
+        """)
 
         # Admin System Tables (Keep Existing)
         cursor.execute("""
@@ -488,6 +518,14 @@ def setup_database():
             ("idx_warnings_user", "warnings(user_id)"),
             ("idx_warnings_guild", "warnings(guild_id)"),
             ("idx_automod_settings_guild", "automod_settings(guild_id)"),
+            # Dalam list indexes, tambahkan:
+            ("idx_polls_guild", "polls(guild_id)"),
+            ("idx_polls_channel", "polls(channel_id)"),
+            ("idx_polls_message", "polls(message_id)"),
+            ("idx_polls_author", "polls(author_id)"),
+            ("idx_polls_active", "polls(is_active)"),
+            ("idx_poll_votes_poll", "poll_votes(poll_id)"),
+            ("idx_poll_votes_user", "poll_votes(user_id)"),
             # Ticket system indexes
             ("idx_tickets_guild", "tickets(guild_id)"),
             ("idx_tickets_channel", "tickets(channel_id)"),
@@ -550,6 +588,8 @@ def verify_database():
             'automod_settings', 'warnings',
             # Ticket system tables
             'ticket_settings', 'tickets', 'ticket_responses'
+            # Dalam list tables, tambahkan:
+            'polls', 'poll_votes'
         ]
 
         missing_tables = []
