@@ -2,65 +2,77 @@ import discord
 from discord.ext import commands
 import asyncio
 import wavelink
+import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
-from .utils import Embed, db, event_dispatcher
+from .utils import Embed, event_dispatcher
+from database import get_connection  # Import fungsi database yang sudah ada
 
 class Music(commands.Cog):
     """🎵 Advanced Music System"""
     
     def __init__(self, bot):
         self.bot = bot
-        self.wavelink = wavelink.Client(bot=bot)
+        bot.loop.create_task(self.connect_nodes())
         self.music_queues = {}
         self.now_playing = {}
         self.text_channels = {}
         self.register_handlers()
-        
-    async def setup_tables(self):
-        """Setup necessary database tables"""
-        async with db.pool.cursor() as cursor:
-            # Music settings
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS music_settings (
-                    guild_id TEXT PRIMARY KEY,
-                    default_volume INTEGER DEFAULT 100,
-                    vote_skip_ratio FLOAT DEFAULT 0.5,
-                    max_queue_size INTEGER DEFAULT 500,
-                    max_song_duration INTEGER DEFAULT 7200,
-                    dj_role TEXT,
-                    music_channel TEXT,
-                    announce_songs BOOLEAN DEFAULT TRUE,
-                    auto_play BOOLEAN DEFAULT FALSE
-                )
-            """)
-            
-            # Playlists
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS playlists (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT,
-                    name TEXT,
-                    owner_id TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(guild_id, name)
-                )
-            """)
-            
-            # Playlist songs 
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS playlist_songs (
-                    playlist_id INTEGER,
-                    track_url TEXT,
-                    track_title TEXT,
-                    added_by TEXT,
-                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (playlist_id) REFERENCES playlists (id)
-                )
-            """)
-            
-            await db.pool.commit()
 
+    async def connect_nodes(self):
+        """Connect to Lavalink nodes"""
+        await self.bot.wait_until_ready()
+        
+        await wavelink.NodePool.create_node(
+            bot=self.bot,
+            host='127.0.0.1',
+            port=2333,
+            password='youshallnotpass'
+        )
+
+    def register_handlers(self):
+        """Register event handlers"""
+        event_dispatcher.register('track_start', self.handle_track_start)
+        event_dispatcher.register('track_end', self.handle_track_end)
+        event_dispatcher.register('track_error', self.handle_track_error)
+
+    async def get_settings(self, guild_id: int) -> Dict:
+        """Get music settings for a guild"""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT * FROM music_settings WHERE guild_id = ?
+            """, (str(guild_id),))
+            data = cursor.fetchone()
+            
+            if not data:
+                default_settings = {
+                    'default_volume': 100,
+                    'vote_skip_ratio': 0.5,
+                    'max_queue_size': 500,
+                    'max_song_duration': 7200,
+                    'dj_role': None,
+                    'music_channel': None,
+                    'announce_songs': True,
+                    'auto_play': False
+                }
+                
+                cursor.execute("""
+                    INSERT INTO music_settings
+                    (guild_id, default_volume, vote_skip_ratio)
+                    VALUES (?, ?, ?)
+                """, (str(guild_id), 100, 0.5))
+                conn.commit()
+                return default_settings
+                
+            return dict(data)
+        finally:
+            if conn:
+                conn.close()
+                
     def register_handlers(self):
         """Register event handlers"""
         event_dispatcher.register('track_start', self.handle_track_start)
@@ -103,12 +115,17 @@ class Music(commands.Cog):
             raise commands.CommandError("❌ You need to be in a voice channel!")
             
         if not ctx.voice_client:
-            await ctx.author.voice.channel.connect(cls=wavelink.Player)
-            self.music_queues[ctx.guild.id] = []
-            self.text_channels[ctx.guild.id] = ctx.channel
+            try:
+                player = await ctx.author.voice.channel.connect(cls=wavelink.Player)
+                self.music_queues[ctx.guild.id] = []
+                self.text_channels[ctx.guild.id] = ctx.channel
+                return player
+            except Exception as e:
+                raise commands.CommandError(f"❌ Failed to join voice channel: {str(e)}")
         else:
             if ctx.author.voice.channel != ctx.voice_client.channel:
                 raise commands.CommandError("❌ You need to be in my voice channel!")
+            return ctx.voice_client
 
     async def handle_track_start(self, player, track):
         """Handle track start event"""
@@ -166,32 +183,41 @@ class Music(commands.Cog):
     @commands.command(name="play", aliases=["p"])
     async def play(self, ctx, *, query: str):
         """🎵 Play a song"""
-        await self.ensure_voice(ctx)
+        player = await self.ensure_voice(ctx)
         
-        # Search for track
-        tracks = await wavelink.YouTubeTrack.search(query)
-        if not tracks:
-            return await ctx.send("❌ No songs found!")
-            
-        track = tracks[0]
-        track.requester = ctx.author
-        
-        settings = await self.get_settings(ctx.guild.id)
-        
-        # Check duration
-        if track.duration > settings['max_song_duration'] * 1000:
-            return await ctx.send("❌ Song is too long!")
-            
-        # Add to queue or play
-        if ctx.voice_client.is_playing():
-            if len(self.music_queues[ctx.guild.id]) >= settings['max_queue_size']:
-                return await ctx.send("❌ Queue is full!")
+        try:
+            # Search for tracks using wavelink v3
+            if not query.startswith('http'):
+                search_query = f'ytsearch:{query}'
+                tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.YouTubeTrack, search_query)
+            else:
+                tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.Track, query)
+
+            if not tracks:
+                return await ctx.send("❌ No songs found!")
                 
-            self.music_queues[ctx.guild.id].append(track)
-            await ctx.send(f"✅ Added to queue: **{track.title}**")
-        else:
-            await ctx.voice_client.play(track)
-            await ctx.send(f"🎵 Now playing: **{track.title}**")
+            track = tracks[0]
+            track.requester = ctx.author
+            
+            settings = await self.get_settings(ctx.guild.id)
+            
+            # Check duration
+            if track.duration > settings['max_song_duration'] * 1000:
+                return await ctx.send("❌ Song is too long!")
+                
+            # Add to queue or play
+            if player.is_playing():
+                if len(self.music_queues[ctx.guild.id]) >= settings['max_queue_size']:
+                    return await ctx.send("❌ Queue is full!")
+                    
+                self.music_queues[ctx.guild.id].append(track)
+                await ctx.send(f"✅ Added to queue: **{track.title}**")
+            else:
+                await player.play(track)
+                await ctx.send(f"🎵 Now playing: **{track.title}**")
+
+        except Exception as e:
+            await ctx.send(f"❌ An error occurred: {str(e)}")
 
     @commands.command(name="stop")
     async def stop(self, ctx):
@@ -339,7 +365,13 @@ class Music(commands.Cog):
     @playlist.command(name="add")
     async def playlist_add(self, ctx, playlist_name: str, *, query: str):
         """Add a song to a playlist"""
-        tracks = await wavelink.YouTubeTrack.search(query)
+        # Use new wavelink search
+        if not query.startswith('http'):
+            search_query = f'ytsearch:{query}'
+            tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.YouTubeTrack, search_query)
+        else:
+            tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.Track, query)
+
         if not tracks:
             return await ctx.send("❌ No songs found!")
             
@@ -351,7 +383,6 @@ class Music(commands.Cog):
                 WHERE guild_id = ? AND name = ?
             """, (str(ctx.guild.id), playlist_name))
             playlist = await cursor.fetchone()
-            
             if not playlist:
                 return await ctx.send("❌ Playlist not found!")
                 
@@ -367,7 +398,7 @@ class Music(commands.Cog):
     @playlist.command(name="play")
     async def playlist_play(self, ctx, *, name: str):
         """Play a playlist"""
-        await self.ensure_voice(ctx)
+        player = await self.ensure_voice(ctx)
         
         async with db.pool.cursor() as cursor:
             await cursor.execute("""
@@ -382,15 +413,24 @@ class Music(commands.Cog):
             return await ctx.send("❌ Playlist is empty!")
             
         for song in songs:
-            tracks = await wavelink.YouTubeTrack.search(song['track_url'])
-            if tracks:
-                track = tracks[0]
-                track.requester = ctx.author
-                
-                if ctx.voice_client.is_playing():
-                    self.music_queues[ctx.guild.id].append(track)
+            try:
+                # Use new wavelink search
+                if not song['track_url'].startswith('http'):
+                    search_query = f'ytsearch:{song["track_url"]}'
+                    tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.YouTubeTrack, search_query)
                 else:
-                    await ctx.voice_client.play(track)
+                    tracks = await wavelink.NodePool.get_node().get_tracks(wavelink.Track, song['track_url'])
+
+                if tracks:
+                    track = tracks[0]
+                    track.requester = ctx.author
+                    
+                    if player.is_playing():
+                        self.music_queues[ctx.guild.id].append(track)
+                    else:
+                        await player.play(track)
+            except Exception as e:
+                await ctx.send(f"❌ Error loading track {song['track_title']}: {str(e)}")
                     
         await ctx.send(f"✅ Added {len(songs)} songs from playlist **{name}** to queue")
 
