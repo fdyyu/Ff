@@ -5,7 +5,9 @@ import io
 import aiohttp
 from datetime import datetime
 from typing import Optional
-from .utils import Embed, db, event_dispatcher
+from .utils import Embed, event_dispatcher
+from database import get_connection
+import sqlite3
 
 class Welcome(commands.Cog):
     """👋 Sistem Welcome Advanced"""
@@ -15,36 +17,6 @@ class Welcome(commands.Cog):
         self.font_path = "assets/fonts/"
         self.background_path = "assets/backgrounds/"
         self.register_handlers()
-        
-    async def setup_tables(self):
-        """Setup necessary database tables"""
-        async with db.pool.cursor() as cursor:
-            # Welcome settings table
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS welcome_settings (
-                    guild_id TEXT PRIMARY KEY,
-                    channel_id TEXT,
-                    message TEXT,
-                    embed_color INTEGER DEFAULT 3447003,
-                    auto_role_id TEXT,
-                    verification_required BOOLEAN DEFAULT FALSE,
-                    custom_background TEXT,
-                    custom_font TEXT
-                )
-            """)
-            
-            # Welcome logs
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS welcome_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    action_type TEXT NOT NULL
-                )
-            """)
-            
-            await db.pool.commit()
 
     def register_handlers(self):
         """Register event handlers"""
@@ -53,11 +25,15 @@ class Welcome(commands.Cog):
 
     async def get_guild_settings(self, guild_id: int) -> dict:
         """Get welcome settings for a guild"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 SELECT * FROM welcome_settings WHERE guild_id = ?
             """, (str(guild_id),))
-            data = await cursor.fetchone()
+            data = cursor.fetchone()
             
             if not data:
                 return {
@@ -71,6 +47,9 @@ class Welcome(commands.Cog):
                 }
                 
             return dict(data)
+        finally:
+            if conn:
+                conn.close()
 
     async def create_welcome_card(self, member: discord.Member, settings: dict) -> io.BytesIO:
         """Create a customized welcome card"""
@@ -253,12 +232,19 @@ class Welcome(commands.Cog):
 
     async def log_welcome(self, guild_id: int, user_id: int, action_type: str):
         """Log welcome events"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 INSERT INTO welcome_logs (guild_id, user_id, action_type)
                 VALUES (?, ?, ?)
             """, (str(guild_id), str(user_id), action_type))
-            await db.pool.commit()
+            conn.commit()
+        finally:
+            if conn:
+                conn.close()
 
     @commands.group(name="welcome")
     @commands.has_permissions(administrator=True)
@@ -270,38 +256,59 @@ class Welcome(commands.Cog):
     @welcome.command(name="setchannel")
     async def set_welcome_channel(self, ctx, channel: discord.TextChannel):
         """Set welcome channel"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 INSERT OR REPLACE INTO welcome_settings 
                 (guild_id, channel_id) VALUES (?, ?)
             """, (str(ctx.guild.id), str(channel.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Welcome channel set to {channel.mention}")
+            await ctx.send(f"✅ Welcome channel set to {channel.mention}")
+        finally:
+            if conn:
+                conn.close()
 
     @welcome.command(name="setmessage")
     async def set_welcome_message(self, ctx, *, message: str):
         """Set custom welcome message"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 INSERT OR REPLACE INTO welcome_settings 
                 (guild_id, message) VALUES (?, ?)
             """, (str(ctx.guild.id), message))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send("✅ Welcome message updated!")
+            await ctx.send("✅ Welcome message updated!")
+        finally:
+            if conn:
+                conn.close()
 
     @welcome.command(name="setrole")
     async def set_auto_role(self, ctx, role: discord.Role):
         """Set auto-role for new members"""
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 INSERT OR REPLACE INTO welcome_settings 
                 (guild_id, auto_role_id) VALUES (?, ?)
             """, (str(ctx.guild.id), str(role.id)))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Auto-role set to {role.mention}")
+            await ctx.send(f"✅ Auto-role set to {role.mention}")
+        finally:
+            if conn:
+                conn.close()
 
     @welcome.command(name="toggleverify")
     async def toggle_verification(self, ctx):
@@ -309,14 +316,21 @@ class Welcome(commands.Cog):
         settings = await self.get_guild_settings(ctx.guild.id)
         new_state = not settings['verification_required']
         
-        async with db.pool.cursor() as cursor:
-            await cursor.execute("""
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
                 INSERT OR REPLACE INTO welcome_settings 
                 (guild_id, verification_required) VALUES (?, ?)
             """, (str(ctx.guild.id), new_state))
-            await db.pool.commit()
+            conn.commit()
             
-        await ctx.send(f"✅ Verification requirement {'enabled' if new_state else 'disabled'}")
+            await ctx.send(f"✅ Verification requirement {'enabled' if new_state else 'disabled'}")
+        finally:
+            if conn:
+                conn.close()
 
     @welcome.command(name="test")
     async def test_welcome(self, ctx):
@@ -326,6 +340,4 @@ class Welcome(commands.Cog):
 
 async def setup(bot):
     """Setup the Welcome cog"""
-    cog = Welcome(bot)
-    await cog.setup_tables()
-    await bot.add_cog(cog)
+    await bot.add_cog(Welcome(bot))
