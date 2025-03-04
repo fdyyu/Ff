@@ -272,7 +272,6 @@ def setup_database():
             )
         """)
 
-            
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS welcome_settings (
                 guild_id TEXT PRIMARY KEY,
@@ -322,6 +321,48 @@ def setup_database():
                 warning_type TEXT NOT NULL,
                 reason TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Ticket System Tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ticket_settings (
+                guild_id TEXT PRIMARY KEY,
+                category_id TEXT,
+                log_channel_id TEXT,
+                support_role_id TEXT,
+                max_tickets INTEGER DEFAULT 1,
+                ticket_format TEXT DEFAULT 'ticket-{user}-{number}',
+                auto_close_hours INTEGER DEFAULT 48,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                reason TEXT,
+                status TEXT DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                closed_at TIMESTAMP,
+                closed_by TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ticket_responses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER,
+                user_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE
             )
         """)
 
@@ -382,6 +423,30 @@ def setup_database():
                 UPDATE automod_settings SET updated_at = CURRENT_TIMESTAMP
                 WHERE guild_id = NEW.guild_id;
             END;
+            """),
+            ("""
+            CREATE TRIGGER IF NOT EXISTS update_ticket_settings_timestamp 
+            AFTER UPDATE ON ticket_settings
+            BEGIN
+                UPDATE ticket_settings SET updated_at = CURRENT_TIMESTAMP
+                WHERE guild_id = NEW.guild_id;
+            END;
+            """),
+            ("""
+            CREATE TRIGGER IF NOT EXISTS update_tickets_timestamp 
+            AFTER UPDATE ON tickets
+            BEGIN
+                UPDATE tickets SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+            """),
+            ("""
+            CREATE TRIGGER IF NOT EXISTS update_ticket_responses_timestamp 
+            AFTER UPDATE ON ticket_responses
+            BEGIN
+                UPDATE ticket_responses SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
             """)
         ]
 
@@ -422,7 +487,15 @@ def setup_database():
             # AutoMod system indexes
             ("idx_warnings_user", "warnings(user_id)"),
             ("idx_warnings_guild", "warnings(guild_id)"),
-            ("idx_automod_settings_guild", "automod_settings(guild_id)")
+            ("idx_automod_settings_guild", "automod_settings(guild_id)"),
+            # Ticket system indexes
+            ("idx_tickets_guild", "tickets(guild_id)"),
+            ("idx_tickets_channel", "tickets(channel_id)"),
+            ("idx_tickets_user", "tickets(user_id)"),
+            ("idx_tickets_status", "tickets(status)"),
+            ("idx_ticket_responses_ticket", "ticket_responses(ticket_id)"),
+            ("idx_ticket_responses_user", "ticket_responses(user_id)"),
+            ("idx_ticket_settings_guild", "ticket_settings(guild_id)")
         ]
 
         for idx_name, idx_cols in indexes:
@@ -474,7 +547,9 @@ def verify_database():
             # Music system tables
             'music_settings', 'playlists', 'playlist_songs',
             # AutoMod system tables
-            'automod_settings', 'warnings'
+            'automod_settings', 'warnings',
+            # Ticket system tables
+            'ticket_settings', 'tickets', 'ticket_responses'
         ]
 
         missing_tables = []
