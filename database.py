@@ -283,26 +283,53 @@ def setup_database():
 
             # 5. Reputation System Tables
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS reputation (
-                    user_id TEXT NOT NULL,
-                    guild_id TEXT NOT NULL,
-                    points INTEGER DEFAULT 0,
-                    received_count INTEGER DEFAULT 0,
-                    given_count INTEGER DEFAULT 0,
-                    last_given TIMESTAMP,
+                CREATE TABLE IF NOT EXISTS reputation_settings (
+                    guild_id TEXT PRIMARY KEY,
+                    cooldown INTEGER DEFAULT 43200,
+                    max_daily INTEGER DEFAULT 3,
+                    min_message_age INTEGER DEFAULT 1800,
+                    required_role TEXT,
+                    blacklisted_roles TEXT,
+                    log_channel TEXT,
+                    auto_roles TEXT,
+                    stack_roles BOOLEAN DEFAULT FALSE,
+                    decay_enabled BOOLEAN DEFAULT FALSE,
+                    decay_days INTEGER DEFAULT 30
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_reputation (
+                    user_id TEXT,
+                    guild_id TEXT,
+                    reputation INTEGER DEFAULT 0,
+                    total_given INTEGER DEFAULT 0,
+                    total_received INTEGER DEFAULT 0,
+                    last_given DATETIME,
+                    last_received DATETIME,
                     PRIMARY KEY (user_id, guild_id)
                 )
             """)
-
+            
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS rep_logs (
+                CREATE TABLE IF NOT EXISTS reputation_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id TEXT NOT NULL,
                     giver_id TEXT NOT NULL,
                     receiver_id TEXT NOT NULL,
+                    message_id TEXT,
                     reason TEXT,
-                    points INTEGER NOT NULL,
-                    given_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    amount INTEGER DEFAULT 1,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS reputation_roles (
+                    guild_id TEXT,
+                    reputation INTEGER,
+                    role_id TEXT,
+                    PRIMARY KEY (guild_id, reputation)
                 )
             """)
 
@@ -437,6 +464,48 @@ def setup_database():
                     FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE
                 )
             """)
+            # Reminder System Tables
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS reminder_settings (
+                    guild_id TEXT PRIMARY KEY,
+                    max_reminders INTEGER DEFAULT 25,
+                    max_duration INTEGER DEFAULT 31536000,
+                    reminder_channel TEXT,
+                    timezone TEXT DEFAULT 'UTC',
+                    mention_roles BOOLEAN DEFAULT FALSE,
+                    allow_everyone BOOLEAN DEFAULT FALSE
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    end_time DATETIME NOT NULL,
+                    repeat_interval TEXT,
+                    last_triggered DATETIME,
+                    mentions TEXT,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS reminder_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    duration TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(guild_id, name)
+                )
+            """)
+
 
             # Create triggers for timestamp updates
             triggers = [
@@ -602,6 +671,17 @@ def setup_database():
                 ("idx_ticket_responses_ticket", "ticket_responses(ticket_id)"),
                 ("idx_ticket_responses_user", "ticket_responses(user_id)"),
                 ("idx_ticket_settings_guild", "ticket_settings(guild_id)")
+                # Tambahkan indexes untuk reputation tables
+                ("idx_reputation_user", "user_reputation(user_id)"),
+                ("idx_reputation_guild", "user_reputation(guild_id)"),
+                ("idx_rep_logs_guild", "reputation_history(guild_id)"),
+                ("idx_rep_roles_guild", "reputation_roles(guild_id)"),
+                ("idx_rep_settings_guild", "reputation_settings(guild_id)"),
+                ("idx_reminders_guild", "reminders(guild_id)"),
+                ("idx_reminders_user", "reminders(user_id)"),
+                ("idx_reminders_end_time", "reminders(end_time)"),
+                ("idx_reminder_templates_guild", "reminder_templates(guild_id)"),
+                ("idx_reminder_settings_guild", "reminder_settings(guild_id)")
             ]
 
             # Create indexes with error handling
@@ -687,6 +767,8 @@ def verify_database():
             
             # Ticket System Tables
             'ticket_settings', 'tickets', 'ticket_responses'
+            # Di bagian tables list, tambahkan:
+            'reminder_settings', 'reminders', 'reminder_templates',
         ]
 
         missing_tables = []
