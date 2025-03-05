@@ -21,9 +21,11 @@ from ext.constants import (
 from ext.balance_manager import BalanceManagerService
 from ext.product_manager import ProductManagerService
 from ext.trx import TransactionManager
+from ext.base_handler import BaseLockHandler, BaseResponseHandler
 
-class AdminCog(commands.Cog, name="Admin"):
+class AdminCog(commands.Cog, name="Admin", BaseLockHandler, BaseResponseHandler):
     def __init__(self, bot):
+        super().__init__()  # Initialize BaseLockHandler
         self.bot = bot
         self.logger = logging.getLogger("AdminCog")
         
@@ -46,9 +48,51 @@ class AdminCog(commands.Cog, name="Admin"):
         """Check if user has admin permissions"""
         is_admin = ctx.author.id == self.admin_id
         if not is_admin:
-            await ctx.send("❌ You don't have permission to use admin commands!")
-            self.logger.warning(f"Unauthorized access attempt by {ctx.author} (ID: {ctx.author.id})")
+            await self.send_response_once(
+                ctx, 
+                content="❌ You don't have permission to use admin commands!"
+            )
+            self.logger.warning(
+                f"Unauthorized access attempt by {ctx.author} (ID: {ctx.author.id})"
+            )
         return is_admin
+
+    async def _process_command(self, ctx, command_name: str, callback) -> bool:
+        """Process command with proper locking and response handling"""
+        # Prevent multiple executions
+        if hasattr(ctx, 'is_being_processed'):
+            return False
+        ctx.is_being_processed = True
+
+        lock = await self.acquire_lock(f"admin_command_{command_name}_{ctx.author.id}")
+        if not lock:
+            await self.send_response_once(
+                ctx, 
+                content="❌ System is busy, please try again later"
+            )
+            return False
+
+        try:
+            if not await self._check_admin(ctx):
+                return False
+
+            response_lock = await self.acquire_response_lock(ctx)
+            if not response_lock:
+                return False
+
+            try:
+                await callback()
+                return True
+            finally:
+                self.release_response_lock(ctx)
+
+        except Exception as e:
+            self.logger.error(f"Error in {command_name}: {e}")
+            await self.send_response_once(ctx, content=f"❌ Error: {str(e)}")
+            return False
+        finally:
+            self.release_lock(f"admin_command_{command_name}_{ctx.author.id}")
+            delattr(ctx, 'is_being_processed')
 
     async def _process_stock_file(self, attachment) -> List[str]:
         """Process uploaded stock file"""
@@ -70,80 +114,84 @@ class AdminCog(commands.Cog, name="Admin"):
 
     async def _confirm_action(self, ctx, message: str, timeout: int = 30) -> bool:
         """Get confirmation for dangerous actions"""
-        confirm_msg = await ctx.send(
-            f"⚠️ **WARNING**\n{message}\nReact with ✅ to confirm or ❌ to cancel."
-        )
-        
-        await confirm_msg.add_reaction('✅')
-        await confirm_msg.add_reaction('❌')
+        lock = await self.acquire_lock(f"confirm_{ctx.author.id}")
+        if not lock:
+            return False
 
         try:
-            reaction, user = await self.bot.wait_for(
-                'reaction_add',
-                timeout=timeout,
-                check=lambda r, u: u == ctx.author and str(r.emoji) in ['✅', '❌']
+            confirm_msg = await ctx.send(
+                f"⚠️ **WARNING**\n{message}\nReact with ✅ to confirm or ❌ to cancel."
             )
-            return str(reaction.emoji) == '✅'
-        except asyncio.TimeoutError:
-            await ctx.send("❌ Operation timed out!")
-            return False
+            
+            await confirm_msg.add_reaction('✅')
+            await confirm_msg.add_reaction('❌')
+
+            try:
+                reaction, user = await self.bot.wait_for(
+                    'reaction_add',
+                    timeout=timeout,
+                    check=lambda r, u: u == ctx.author and str(r.emoji) in ['✅', '❌']
+                )
+                return str(reaction.emoji) == '✅'
+            except asyncio.TimeoutError:
+                await self.send_response_once(ctx, content="❌ Operation timed out!")
+                return False
+        finally:
+            self.release_lock(f"confirm_{ctx.author.id}")
 
     @commands.command(name="adminhelp")
     async def admin_help(self, ctx):
         """Show admin commands"""
-        if not await self._check_admin(ctx):
-            return
-
-        embed = discord.Embed(
-            title="🛠️ Admin Commands",
-            description="Available administrative commands",
-            color=discord.Color.blue(),
-            timestamp=datetime.utcnow()
-        )
-
-        command_categories = {
-            "Product Management": [
-                "`addproduct <code> <name> <price> [description]`\nAdd new product",
-                "`editproduct <code> <field> <value>`\nEdit product details",
-                "`deleteproduct <code>`\nDelete product",
-                "`addstock <code>`\nAdd stock with file attachment"
-            ],
-            "Balance Management": [
-                "`addbal <growid> <amount> <WL/DL/BGL>`\nAdd balance",
-                "`removebal <growid> <amount> <WL/DL/BGL>`\nRemove balance",
-                "`checkbal <growid>`\nCheck balance",
-                "`resetuser <growid>`\nReset balance"
-            ],
-            "Transaction Management": [
-                "`trxhistory <growid> [limit]`\nView transactions",
-                "`stockhistory <code> [limit]`\nView stock history"
-            ],
-            "System Management": [
-                "`botinfo`\nShow bot system information",
-                "`announcement <message>`\nSend announcement to all users",
-                "`maintenance <on/off>`\nToggle maintenance mode",
-                "`blacklist <add/remove> <growid>`\nManage blacklisted users",
-                "`backup`\nCreate database backup"
-            ]
-        }
-
-        for category, commands in command_categories.items():
-            embed.add_field(
-                name=f"📋 {category}",
-                value="\n\n".join(commands),
-                inline=False
+        async def execute():
+            embed = discord.Embed(
+                title="🛠️ Admin Commands",
+                description="Available administrative commands",
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
             )
 
-        embed.set_footer(text=f"Requested by {ctx.author}")
-        await ctx.send(embed=embed)
+            command_categories = {
+                "Product Management": [
+                    "`addproduct <code> <name> <price> [description]`\nAdd new product",
+                    "`editproduct <code> <field> <value>`\nEdit product details",
+                    "`deleteproduct <code>`\nDelete product",
+                    "`addstock <code>`\nAdd stock with file attachment"
+                ],
+                "Balance Management": [
+                    "`addbal <growid> <amount> <WL/DL/BGL>`\nAdd balance",
+                    "`removebal <growid> <amount> <WL/DL/BGL>`\nRemove balance",
+                    "`checkbal <growid>`\nCheck balance",
+                    "`resetuser <growid>`\nReset balance"
+                ],
+                "Transaction Management": [
+                    "`trxhistory <growid> [limit]`\nView transactions",
+                    "`stockhistory <code> [limit]`\nView stock history"
+                ],
+                "System Management": [
+                    "`systeminfo`\nShow bot system information",
+                    "`announcement <message>`\nSend announcement to all users",
+                    "`maintenance <on/off>`\nToggle maintenance mode",
+                    "`blacklist <add/remove> <growid>`\nManage blacklisted users",
+                    "`backup`\nCreate database backup"
+                ]
+            }
+
+            for category, commands in command_categories.items():
+                embed.add_field(
+                    name=f"📋 {category}",
+                    value="\n\n".join(commands),
+                    inline=False
+                )
+
+            embed.set_footer(text=f"Requested by {ctx.author}")
+            await self.send_response_once(ctx, embed=embed)
+
+        await self._process_command(ctx, "adminhelp", execute)
 
     @commands.command(name="addproduct")
     async def add_product(self, ctx, code: str, name: str, price: int, *, description: Optional[str] = None):
         """Add new product"""
-        if not await self._check_admin(ctx):
-            return
-            
-        try:
+        async def execute():
             result = await self.product_service.create_product(
                 code=code,
                 name=name,
@@ -162,91 +210,101 @@ class AdminCog(commands.Cog, name="Admin"):
             if result['description']:
                 embed.add_field(name="Description", value=result['description'], inline=False)
             
-            await ctx.send(embed=embed)
+            await self.send_response_once(ctx, embed=embed)
             self.logger.info(f"Product {code} added by {ctx.author}")
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error adding product: {e}")
+
+        await self._process_command(ctx, "addproduct", execute)
 
     @commands.command(name="addstock")
     async def add_stock(self, ctx, code: str):
         """Add stock from file"""
-        if not await self._check_admin(ctx):
-            return
-            
-        if not ctx.message.attachments:
-            await ctx.send("❌ Please attach a text file containing the stock items!")
-            return
-
-        try:
-            # Verify product exists
-            product = await self.product_service.get_product(code())
-            if not product:
-                await ctx.send(f"❌ Product code `{code}` not found!")
+        async def execute():
+            if not ctx.message.attachments:
+                await self.send_response_once(
+                    ctx,
+                    content="❌ Please attach a text file containing the stock items!"
+                )
                 return
-            
+
+            # Verify product exists
+            product = await self.product_service.get_product(code)
+            if not product:
+                await self.send_response_once(
+                    ctx,
+                    content=f"❌ Product code `{code}` not found!"
+                )
+                return
+
             # Process stock file
             items = await self._process_stock_file(ctx.message.attachments[0])
-            
+
             # Add stock with progress updates
             progress_msg = await ctx.send("⏳ Adding stock items...")
             added_count = 0
             failed_count = 0
-            
+
             for i, item in enumerate(items, 1):
                 try:
                     await self.product_service.add_stock_item(
-                        code(),
+                        code,
                         item,
                         str(ctx.author.id)
                     )
                     added_count += 1
                 except:
                     failed_count += 1
-                
-                if i % 10 == 0:  # Update progress every 10 items
-                    await progress_msg.edit(content=f"⏳ Processing... {i}/{len(items)} items")
-            
+
+                if i % 10 == 0:
+                    await progress_msg.edit(
+                        content=f"⏳ Processing... {i}/{len(items)} items"
+                    )
+
             embed = discord.Embed(
                 title="✅ Stock Added",
                 color=discord.Color.green(),
                 timestamp=datetime.utcnow()
             )
-            embed.add_field(name="Product", value=f"{product['name']} ({code()})", inline=False)
+            embed.add_field(
+                name="Product",
+                value=f"{product['name']} ({code})",
+                inline=False
+            )
             embed.add_field(name="Total Items", value=len(items), inline=True)
             embed.add_field(name="Added", value=added_count, inline=True)
             embed.add_field(name="Failed", value=failed_count, inline=True)
-            
+
             await progress_msg.delete()
-            await ctx.send(embed=embed)
-            self.logger.info(f"Stock added for {code} by {ctx.author}: {added_count} success, {failed_count} failed")
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error adding stock: {e}")
+            await self.send_response_once(ctx, embed=embed)
+            self.logger.info(
+                f"Stock added for {code} by {ctx.author}: "
+                f"{added_count} success, {failed_count} failed"
+            )
+
+        await self._process_command(ctx, "addstock", execute)
 
     @commands.command(name="addbal")
     async def add_balance(self, ctx, growid: str, amount: int, currency: str):
         """Add balance to user"""
-        if not await self._check_admin(ctx):
-            return
-            
-        try:
-            currency = currency()
-            if currency not in CURRENCY_RATES:
-                await ctx.send(f"❌ Invalid currency. Use: {', '.join(CURRENCY_RATES.keys())}")
+        async def execute():
+            if currency.upper() not in CURRENCY_RATES:
+                await self.send_response_once(
+                    ctx,
+                    content=f"❌ Invalid currency. Use: {', '.join(CURRENCY_RATES.keys())}"
+                )
                 return
 
             if amount <= 0:
-                await ctx.send("❌ Amount must be positive!")
+                await self.send_response_once(
+                    ctx,
+                    content="❌ Amount must be positive!"
+                )
                 return
 
-            # Convert to appropriate currency
-            wls = amount if currency == "WL" else amount * CURRENCY_RATES[currency]
-            
+            # Convert to WLs
+            wls = amount if currency == "WL" else amount * CURRENCY_RATES[currency.upper()]
+
             new_balance = await self.balance_service.update_balance(
-                growid=growid(),
+                growid=growid,
                 wl=wls,
                 details=f"Added by admin {ctx.author}",
                 transaction_type=TRANSACTION_ADMIN_ADD
@@ -257,39 +315,39 @@ class AdminCog(commands.Cog, name="Admin"):
                 color=discord.Color.green(),
                 timestamp=datetime.utcnow()
             )
-            embed.add_field(name="GrowID", value=growid(), inline=True)
-            embed.add_field(name="Added", value=f"{amount:,} {currency}", inline=True)
+            embed.add_field(name="GrowID", value=growid, inline=True)
+            embed.add_field(name="Added", value=f"{amount:,} {currency.upper()}", inline=True)
             embed.add_field(name="New Balance", value=new_balance.format(), inline=False)
             embed.set_footer(text=f"Added by {ctx.author}")
 
-            await ctx.send(embed=embed)
+            await self.send_response_once(ctx, embed=embed)
             self.logger.info(f"Balance added for {growid} by {ctx.author}")
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error adding balance: {e}")
+
+        await self._process_command(ctx, "addbal", execute)
 
     @commands.command(name="removebal")
     async def remove_balance(self, ctx, growid: str, amount: int, currency: str):
         """Remove balance from user"""
-        if not await self._check_admin(ctx):
-            return
-            
-        try:
-            currency = currency()
-            if currency not in CURRENCY_RATES:
-                await ctx.send(f"❌ Invalid currency. Use: {', '.join(CURRENCY_RATES.keys())}")
+        async def execute():
+            if currency.upper() not in CURRENCY_RATES:
+                await self.send_response_once(
+                    ctx,
+                    content=f"❌ Invalid currency. Use: {', '.join(CURRENCY_RATES.keys())}"
+                )
                 return
 
             if amount <= 0:
-                await ctx.send("❌ Amount must be positive!")
+                await self.send_response_once(
+                    ctx,
+                    content="❌ Amount must be positive!"
+                )
                 return
 
-            # Convert to WLs and make negative for removal
-            wls = -(amount if currency == "WL" else amount * CURRENCY_RATES[currency])
-            
+            # Convert to negative WLs
+            wls = -(amount if currency == "WL" else amount * CURRENCY_RATES[currency.upper()])
+
             new_balance = await self.balance_service.update_balance(
-                growid=growid(),
+                growid=growid,
                 wl=wls,
                 details=f"Removed by admin {ctx.author}",
                 transaction_type=TRANSACTION_ADMIN_REMOVE
@@ -300,39 +358,37 @@ class AdminCog(commands.Cog, name="Admin"):
                 color=discord.Color.red(),
                 timestamp=datetime.utcnow()
             )
-            embed.add_field(name="GrowID", value=growid(), inline=True)
-            embed.add_field(name="Removed", value=f"{amount:,} {currency}", inline=True)
+            embed.add_field(name="GrowID", value=growid, inline=True)
+            embed.add_field(name="Removed", value=f"{amount:,} {currency.upper()}", inline=True)
             embed.add_field(name="New Balance", value=new_balance.format(), inline=False)
             embed.set_footer(text=f"Removed by {ctx.author}")
 
-            await ctx.send(embed=embed)
+            await self.send_response_once(ctx, embed=embed)
             self.logger.info(f"Balance removed from {growid} by {ctx.author}")
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error removing balance: {e}")
+
+        await self._process_command(ctx, "removebal", execute)
 
     @commands.command(name="checkbal")
     async def check_balance(self, ctx, growid: str):
         """Check user balance"""
-        if not await self._check_admin(ctx):
-            return
-            
-        try:
-            balance = await self.balance_service.get_balance(growid())
+        async def execute():
+            balance = await self.balance_service.get_balance(growid)
             if not balance:
-                await ctx.send(f"❌ User {growid} not found!")
+                await self.send_response_once(
+                    ctx,
+                    content=f"❌ User {growid} not found!"
+                )
                 return
 
-            transactions = await self.trx_manager.get_transaction_history(growid(), limit=5)
+            transactions = await self.trx_manager.get_transaction_history(growid, limit=5)
 
             embed = discord.Embed(
-                title=f"👤 User Information - {growid()}",
+                title=f"👤 User Information - {growid}",
                 color=discord.Color.blue(),
                 timestamp=datetime.utcnow()
             )
             embed.add_field(name="Current Balance", value=balance.format(), inline=False)
-            
+
             if transactions:
                 recent_tx = "\n".join([
                     f"• {tx['type']} - {tx['timestamp']}: {tx['details']}"
@@ -341,27 +397,27 @@ class AdminCog(commands.Cog, name="Admin"):
                 embed.add_field(name="Recent Transactions", value=recent_tx, inline=False)
 
             embed.set_footer(text=f"Checked by {ctx.author}")
-            await ctx.send(embed=embed)
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error checking balance: {e}")
+            await self.send_response_once(ctx, embed=embed)
+
+        await self._process_command(ctx, "checkbal", execute)
 
     @commands.command(name="resetuser")
     async def reset_user(self, ctx, growid: str):
         """Reset user balance"""
-        if not await self._check_admin(ctx):
-            return
-
-        try:
-            if not await self._confirm_action(ctx, f"Are you sure you want to reset {growid}'s balance?"):
-                await ctx.send("❌ Operation cancelled.")
+        async def execute():
+            if not await self._confirm_action(
+                ctx, 
+                f"Are you sure you want to reset {growid}'s balance?"
+            ):
+                await self.send_response_once(ctx, content="❌ Operation cancelled.")
                 return
 
-            growid = growid()
             current_balance = await self.balance_service.get_balance(growid)
             if not current_balance:
-                await ctx.send(f"❌ User {growid} not found!")
+                await self.send_response_once(
+                    ctx,
+                    content=f"❌ User {growid} not found!"
+                )
                 return
 
             # Reset balance
@@ -384,22 +440,15 @@ class AdminCog(commands.Cog, name="Admin"):
             embed.add_field(name="New Balance", value=new_balance.format(), inline=False)
             embed.set_footer(text=f"Reset by {ctx.author}")
 
-            await ctx.send(embed=embed)
+            await self.send_response_once(ctx, embed=embed)
             self.logger.info(f"Balance reset for {growid} by {ctx.author}")
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error resetting user: {e}")
 
-    # Fitur Admin Baru
+        await self._process_command(ctx, "resetuser", execute)
 
-    @commands.command(name="systeminfo")  # Ubah nama command dari "botinfo" menjadi "systeminfo"
+    @commands.command(name="systeminfo")
     async def system_info(self, ctx):
         """Show bot system information"""
-        if not await self._check_admin(ctx):
-            return
-
-        try:
+        async def execute():
             # Get system info
             cpu_usage = psutil.cpu_percent()
             memory = psutil.virtual_memory()
@@ -432,21 +481,19 @@ class AdminCog(commands.Cog, name="Admin"):
             )
             embed.add_field(name="🤖 Bot", value=bot_stats, inline=False)
             
-            await ctx.send(embed=embed)
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error getting bot info: {e}")
+            await self.send_response_once(ctx, embed=embed)
+
+        await self._process_command(ctx, "systeminfo", execute)
 
     @commands.command(name="announcement")
     async def announcement(self, ctx, *, message: str):
         """Send announcement to all users"""
-        if not await self._check_admin(ctx):
-            return
-
-        try:
-            if not await self._confirm_action(ctx, "Are you sure you want to send this announcement to all users?"):
-                await ctx.send("❌ Announcement cancelled.")
+        async def execute():
+            if not await self._confirm_action(
+                ctx,
+                "Are you sure you want to send this announcement to all users?"
+            ):
+                await self.send_response_once(ctx, content="❌ Announcement cancelled.")
                 return
 
             # Get all users from database
@@ -480,7 +527,9 @@ class AdminCog(commands.Cog, name="Admin"):
                         await user.send(embed=embed)
                         sent_count += 1
                         if sent_count % 10 == 0:
-                            await progress_msg.edit(content=f"⏳ Sending... ({sent_count}/{len(users)})")
+                            await progress_msg.edit(
+                                content=f"⏳ Sending... ({sent_count}/{len(users)})"
+                            )
                 except:
                     failed_count += 1
 
@@ -495,23 +544,24 @@ class AdminCog(commands.Cog, name="Admin"):
             result_embed.add_field(name="Sent Successfully", value=sent_count, inline=True)
             result_embed.add_field(name="Failed", value=failed_count, inline=True)
             
-            await ctx.send(embed=result_embed)
-            self.logger.info(f"Announcement sent by {ctx.author}: {sent_count} success, {failed_count} failed")
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error sending announcement: {e}")
+            await self.send_response_once(ctx, embed=result_embed)
+            self.logger.info(
+                f"Announcement sent by {ctx.author}: "
+                f"{sent_count} success, {failed_count} failed"
+            )
+
+        await self._process_command(ctx, "announcement", execute)
 
     @commands.command(name="maintenance")
     async def maintenance(self, ctx, mode: str):
         """Toggle maintenance mode"""
-        if not await self._check_admin(ctx):
-            return
-
-        try:
-            mode = mode.lower()
-            if mode not in ['on', 'off']:
-                await ctx.send("❌ Please specify 'on' or 'off'")
+        async def execute():
+            mode_lower = mode.lower()
+            if mode_lower not in ['on', 'off']:
+                await self.send_response_once(
+                    ctx,
+                    content="❌ Please specify 'on' or 'off'"
+                )
                 return
 
             # Update maintenance status in database
@@ -521,7 +571,7 @@ class AdminCog(commands.Cog, name="Admin"):
                 cursor = conn.cursor()
                 cursor.execute(
                     "INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)",
-                    ("maintenance_mode", "1" if mode == "on" else "0")
+                    ("maintenance_mode", "1" if mode_lower == "on" else "0")
                 )
                 conn.commit()
             finally:
@@ -530,16 +580,16 @@ class AdminCog(commands.Cog, name="Admin"):
 
             embed = discord.Embed(
                 title="🔧 Maintenance Mode",
-                description=f"Maintenance mode has been turned **{mode()}**",
-                color=discord.Color.orange() if mode == "on" else discord.Color.green(),
+                description=f"Maintenance mode has been turned **{mode_lower}**",
+                color=discord.Color.orange() if mode_lower == "on" else discord.Color.green(),
                 timestamp=datetime.utcnow()
             )
             embed.set_footer(text=f"Changed by {ctx.author}")
             
-            await ctx.send(embed=embed)
-            self.logger.info(f"Maintenance mode {mode} by {ctx.author}")
+            await self.send_response_once(ctx, embed=embed)
+            self.logger.info(f"Maintenance mode {mode_lower} by {ctx.author}")
 
-            if mode == "on":
+            if mode_lower == "on":
                 # Notify all online users
                 for guild in self.bot.guilds:
                     for member in guild.members:
@@ -552,21 +602,19 @@ class AdminCog(commands.Cog, name="Admin"):
                                 )
                             except:
                                 continue
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error toggling maintenance mode: {e}")
+
+        await self._process_command(ctx, "maintenance", execute)
 
     @commands.command(name="blacklist")
     async def blacklist(self, ctx, action: str, growid: str):
         """Manage blacklisted users"""
-        if not await self._check_admin(ctx):
-            return
-
-        try:
-            action = action.lower()
-            if action not in ['add', 'remove']:
-                await ctx.send("❌ Please specify 'add' or 'remove'")
+        async def execute():
+            action_lower = action.lower()
+            if action_lower not in ['add', 'remove']:
+                await self.send_response_once(
+                    ctx,
+                    content="❌ Please specify 'add' or 'remove'"
+                )
                 return
 
             conn = None
@@ -574,53 +622,65 @@ class AdminCog(commands.Cog, name="Admin"):
                 conn = get_connection()
                 cursor = conn.cursor()
                 
-                if action == "add":
+                if action_lower == "add":
                     # Check if user exists
-                    cursor.execute("SELECT growid FROM users WHERE growid = ?", (growid(),))
+                    cursor.execute(
+                        "SELECT growid FROM users WHERE growid = ?",
+                        (growid,)
+                    )
                     if not cursor.fetchone():
-                        await ctx.send(f"❌ User {growid} not found!")
+                        await self.send_response_once(
+                            ctx,
+                            content=f"❌ User {growid} not found!"
+                        )
                         return
 
                     # Add to blacklist
                     cursor.execute(
-                        "INSERT OR REPLACE INTO blacklist (growid, added_by, added_at) VALUES (?, ?, ?)",
-                        (growid(), str(ctx.author.id), datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))
+                        """
+                        INSERT OR REPLACE INTO blacklist 
+                        (growid, added_by, added_at) VALUES (?, ?, ?)
+                        """,
+                        (
+                            growid,
+                            str(ctx.author.id),
+                            datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                        )
                     )
                 else:
                     # Remove from blacklist
                     cursor.execute(
                         "DELETE FROM blacklist WHERE growid = ?",
-                        (growid(),)
+                        (growid,)
                     )
 
                 conn.commit()
 
                 embed = discord.Embed(
                     title="⛔ Blacklist Updated",
-                    description=f"User {growid()} has been {'added to' if action == 'add' else 'removed from'} the blacklist.",
-                    color=discord.Color.red() if action == 'add' else discord.Color.green(),
+                    description=(
+                        f"User {growid} has been "
+                        f"{'added to' if action_lower == 'add' else 'removed from'} "
+                        f"the blacklist."
+                    ),
+                    color=discord.Color.red() if action_lower == 'add' else discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
                 embed.set_footer(text=f"Updated by {ctx.author}")
                 
-                await ctx.send(embed=embed)
-                self.logger.info(f"User {growid} {action}ed to blacklist by {ctx.author}")
+                await self.send_response_once(ctx, embed=embed)
+                self.logger.info(f"User {growid} {action_lower}ed to blacklist by {ctx.author}")
                 
             finally:
                 if conn:
                     conn.close()
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error updating blacklist: {e}")
+
+        await self._process_command(ctx, "blacklist", execute)
 
     @commands.command(name="backup")
     async def backup(self, ctx):
         """Create database backup"""
-        if not await self._check_admin(ctx):
-            return
-
-        try:
+        async def execute():
             # Create backup filename with timestamp
             timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
             backup_filename = f"backup_{timestamp}.db"
@@ -636,8 +696,9 @@ class AdminCog(commands.Cog, name="Admin"):
                 backup_data.seek(0)
                 
                 # Send backup file
-                await ctx.send(
-                    "✅ Database backup created!",
+                await self.send_response_once(
+                    ctx,
+                    content="✅ Database backup created!",
                     file=discord.File(backup_data, filename=backup_filename)
                 )
                 self.logger.info(f"Database backup created by {ctx.author}")
@@ -645,14 +706,15 @@ class AdminCog(commands.Cog, name="Admin"):
             finally:
                 if conn:
                     conn.close()
-            
-        except Exception as e:
-            await ctx.send(f"❌ Error: {str(e)}")
-            self.logger.error(f"Error creating backup: {e}")
+
+        await self._process_command(ctx, "backup", execute)
 
 async def setup(bot):
     """Setup the Admin cog"""
     if not hasattr(bot, 'admin_cog_loaded'):
         await bot.add_cog(AdminCog(bot))
         bot.admin_cog_loaded = True
-        logging.info(f'Admin cog loaded successfully at {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC')
+        logging.info(
+            f'Admin cog loaded successfully at '
+            f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC'
+        )
